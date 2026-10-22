@@ -106,6 +106,14 @@ October 22, 2026, session 5 (release) done:
 - v0.1.0 published by the workflow on commit cfc1310 after CI passed: all five builds passed their engine tests and smoke tests, release "KvSQL v0.1.0" (not a pre-release) with five archives and SHA256SUMS. The Linux x86_64 archive was downloaded through releases/latest/download, its checksum matched, and its binaries ran.
 - Open points for later: benchmarks against the Rust neighbours (redb, fjall, GlueSQL) named in the screening record; Windows readers may wait behind a commit's flush because synchronous file handles serialise I/O there (delay only, not wrong data); single-sync commits would close most of the commit gap with SQLite.
 
+October 22, 2026, session 6 (site) done, at YK's word "go, including case studies and use examples, listing and notes to softdevstudio.com":
+
+- crates/kvsql-db/examples/case_studies.rs: the site's three case studies (sessions and reporting on one table, an edge gateway with kvsqld over HTTP, a checkout mixing both doors in one transaction with a power cut at every step of its commit, each cut replayed 200 ways) and three use examples (cache with expiry, settings in a plain keyspace, the shell). record-results.sh saves its output as test/results/latest/case-studies.md, recorded in the same run as checks.log and bench.md.
+- photozeitgeist/kvsql.com rebuilt: themes/, archetypes/, README.md (the theme's manual), .gitignore and content/archive/_index.md left as they were; every other page, post, image, the old AltSql demo apps and every config value replaced. Pages: about, contact, quick start, download, reference. Posts: launch, explainer, how it was tested, the name, the SQLite benchmark, three case studies (tag "case studies") and three use examples (tag "use examples"), with menu entries to both tag pages. Eight images drawn from the recorded results in static/images. Built with Hugo 0.147.9 (the live sites' version), every internal link checked, titles free of special characters, and the live feed confirmed the URLs after deploy. The quick start snippets were compiled and run against the engine.
+- softdevstudio.com: KvSQL added as the twenty-seventh project (data/studio.toml entry, CONTENT-PLAN brief, names, tag, footer, feeds row, session log row 2m, NEXT SESSION) and a short note on 0.1.0 linking the kvsql.com posts and the release.
+
+The approved six-session plan is complete. Open points for later, each needing YK's approval as a new step: benchmarks against redb, fjall and GlueSQL; a single-sync commit; Windows readers waiting behind a commit's flush; prepared statements and faster SQL execution.
+
 ## Next
 
-Session 6 (site), after YK's go-ahead.
+Nothing approved. Waiting for YK.
