@@ -1,0 +1,66 @@
+UTC: 2026-10-22T07:03:17Z
+Host: Linux x86_64
+rustc 1.97.0 (2d8144b78 2026-07-07)
+cargo 1.97.0 (c980f4866 2026-06-30)
+Parent commit: HEAD
+unknown
+Settings: KVSQL_POWER_CUTS=20000 KVSQL_MODEL_ROUNDS=2000 KVSQL_KILL_ROUNDS=200
+    Checking kvsql-engine v0.1.0 (/home/claude/kvsql/crates/kvsql-engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
+    Finished `release` profile [optimized] target(s) in 0.06s
+     Running unittests src/lib.rs (target/release/deps/kvsql_engine-14e478737f54e3fb)
+
+running 2 tests
+test crc32::tests::known_vector ... ok
+test page::tests::seal_then_check ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/kill_writer.rs (target/release/deps/kill_writer-f36817b412726b18)
+
+running 2 tests
+test child_writer ... ok
+test sigkill_never_loses_an_acknowledged_commit ... sigkill: seed 1792652598905933560 (rerun with KVSQL_SEED=1792652598905933560)
+sigkill: 200 kills, 7628 commits acknowledged
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.35s
+
+     Running tests/kv.rs (target/release/deps/kv-d4a69dacece7675f)
+
+running 12 tests
+test damaged_page_is_reported_not_returned ... ok
+test deep_tree_grows_and_shrinks ... ok
+test dropped_transaction_changes_nothing ... ok
+test file_is_reused_not_grown_forever ... ok
+test keyspaces_are_separate ... ok
+test large_values_round_trip ... ok
+test put_get_delete_scan ... ok
+test random_ops_match_model ... random_ops_match_model: seed 1792652606956451569 (rerun with KVSQL_SEED=1792652606956451569)
+final: VerifyReport { txid: 1810, page_count: 221, used_pages: 69, free_pages: 152, keyspaces: 3, keys: 316 }
+ok
+test real_file_persists_and_locks ... ok
+test rejects_bad_input ... ok
+test rejects_files_that_are_not_kvsql ... ok
+test transaction_sees_its_own_writes_in_scans ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.25s
+
+     Running tests/power_cut.rs (target/release/deps/power_cut-8ef80eb210c8973e)
+
+running 2 tests
+test power_cut_never_loses_or_tears_a_commit ... power_cut: seed 1792652608521365998 (rerun with KVSQL_SEED=1792652608521365998)
+power_cut: 20000 rounds, 6121 cuts inside a commit (515 in-flight commits landed whole, 5606 rolled back whole)
+ok
+test power_cut_while_creating_the_file ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.32s
+
+   Doc-tests kvsql_engine
+
+running 1 test
+test crates/kvsql-engine/src/lib.rs - (line 8) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.58s
+
+PASS: formatting, clippy, unit, model, power-cut and SIGKILL tests

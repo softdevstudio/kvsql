@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Run every check and record the output in test/results/latest.
+# Any number quoted on kvsql.com comes from a run of this script.
+#
+# Heavier settings than plain `cargo test`; override with the same variables:
+#   KVSQL_POWER_CUTS   simulated power cuts            (default here 20000)
+#   KVSQL_MODEL_ROUNDS model-check transaction rounds  (default here 2000)
+#   KVSQL_KILL_ROUNDS  real-process SIGKILL rounds     (default here 200)
+#   KVSQL_SEED         replay one seed
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+export KVSQL_POWER_CUTS="${KVSQL_POWER_CUTS:-20000}"
+export KVSQL_MODEL_ROUNDS="${KVSQL_MODEL_ROUNDS:-2000}"
+export KVSQL_KILL_ROUNDS="${KVSQL_KILL_ROUNDS:-200}"
+
+result_dir="test/results"
+mkdir -p "$result_dir"
+# One current run lives in test/results/latest; git history keeps earlier runs.
+result_path="$result_dir/latest"
+rm -rf "$result_path"
+mkdir "$result_path"
+exec > >(tee "$result_path/checks.log") 2>&1
+
+printf 'UTC: %s\n' "$(date -u +%FT%TZ)"
+printf 'Host: %s %s\n' "$(uname -s)" "$(uname -m)"
+rustc --version
+cargo --version
+printf 'Parent commit: %s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
+printf 'Settings: KVSQL_POWER_CUTS=%s KVSQL_MODEL_ROUNDS=%s KVSQL_KILL_ROUNDS=%s\n' \
+  "$KVSQL_POWER_CUTS" "$KVSQL_MODEL_ROUNDS" "$KVSQL_KILL_ROUNDS"
+
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --release -- --nocapture --test-threads=1
+
+printf 'PASS: formatting, clippy, unit, model, power-cut and SIGKILL tests\n'
