@@ -7,7 +7,7 @@ There are two products:
 - **KvSQL Engine**, a Rust library you embed in your program. One file on disk, no server.
 - **KvSQL DB**, a database server and command-line shell built on the engine.
 
-Status: early development. The storage engine and key-value API work and are tested. SQL and the server come next. Nothing is released yet.
+Status: early development. The storage engine, key-value API and snapshot readers work and are tested. SQL and the server come next. Nothing is released yet.
 
 ## Why one store for both
 
@@ -43,7 +43,22 @@ let page = db.scan("users", b"40", Some(b"50"), 100)?;  // keys 40 up to 50
 
 Data lives in keyspaces: named, ordered maps from byte keys to byte values. `put` creates a keyspace the first time it is used. Keys are 1 to 512 bytes. Values can be up to 1 GiB.
 
-A write transaction sees its own changes. Dropping it without `commit` discards everything. One write transaction runs at a time.
+A write transaction sees its own changes. Dropping it without `commit` discards everything. One write transaction runs at a time; a second `begin_write` waits for the first to finish.
+
+## Readers run beside the writer
+
+Reads never wait for the writer. Each read works on a snapshot: the database as of the last commit before the read began.
+
+```rust
+let mut snap = db.begin_read()?;
+let a = snap.get("accounts", b"alice")?;
+// ... the writer commits a transfer here ...
+let b = snap.get("accounts", b"bob")?;   // still the same snapshot
+```
+
+Both reads come from the same commit, so totals add up even while money moves. `db.get` and `db.scan` open a short snapshot of their own.
+
+Committed data is never changed in place, which is what makes this work. Pages a commit stops using are reused only after every reader that could still see them has finished. A reader kept open for a long time therefore makes the file grow; close readers when you are done with them.
 
 `db.verify()` reads every page in the file and checks every rule the format depends on. It is the check the crash tests run after each simulated failure.
 
@@ -61,6 +76,8 @@ Only one process can open a file at a time. A second open gets `Error::Locked`.
 
 - A model check runs thousands of random transactions (puts, deletes, large values, dropped keyspaces, rolled-back transactions) against an in-memory copy and verifies the whole file after every commit.
 - A simulated disk cuts the power at a random write or sync inside commits. It then keeps, drops, reorders or tears the writes that were not yet synced, the way a real disk can. The reopened file must verify and hold exactly the last finished commit or the one in flight.
+- Half the power-cut rounds keep a reader open across the commits; its view must not change.
+- Reader threads hold snapshots for random times while a writer moves money between accounts and churns pages. Every snapshot must show the same total twice and every value intact.
 - A real writer process is killed with SIGKILL at random moments. Every commit it reported as done must be in the file.
 
 Run them all and record the output:

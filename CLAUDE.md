@@ -72,8 +72,16 @@ October 22, 2026, session 1 (foundation) done:
 - Tests: tests/kv.rs (operations, edges, model check against a BTreeMap with verify after every commit, deep tree grow and shrink, page reuse, file lock, damaged pages), tests/power_cut.rs, tests/kill_writer.rs. Mutation checks during development: removing the sync before the meta write, or reusing pages still reachable from the last commit, both fail power_cut at once.
 - Rough single-thread numbers on the dev container (examples/quick_bench.rs, in-memory disk, 60,000 keys in one transaction): about 4 µs per insert and under 1 µs per get. Not recorded, not for the site.
 
-Next session starts at session 2: snapshot readers that do not block on the writer (pages freed while a reader holds an older snapshot must wait), read transactions with a stable view, and tests for readers running beside a writer through power cuts.
+October 22, 2026, session 2 (transactions) done:
+
+- db.rs split into Shared state: storage, a 16-shard page cache, committed State behind a short mutex, and a separate writer mutex held for a write transaction's life. ReadTx (Db::begin_read) pins the commit it started on; Db::get, scan and keyspaces use short read transactions. WriteTx gained keyspaces().
+- Free pages carry the commit that freed them (Free { id, freed_at }). begin_write splits them into reusable (freed_at <= oldest open snapshot) and held. The tag is in memory only; on open everything listed is reusable.
+- Storage now requires Send + Sync.
+- Tests: tests/snapshots.rs (isolation, reader does not block writer, open reader holds pages then releases them, four reader threads checking a constant total and self-checking values twice per snapshot while a writer moves money and churns junk keys). power_cut.rs holds readers across commits in half the rounds and checks their view after each commit. Mutation checks: ignoring open readers when reusing pages, and tagging freed pages one commit early, both fail the churn test at once.
+- Rough numbers on the dev container (not recorded): about 5 µs per insert and 1.4 µs per get. Get got slower than session 1 because each one now registers a snapshot under the state mutex; worth revisiting in session 5 if benchmarks show contention.
+
+Next session starts at session 3: SQL. Tables stored as keyspaces with rows keyed by primary key, a catalog keyspace, parser, executor, secondary indexes kept in the same transaction, and random SQL compared against SQLite (rusqlite as a dev-dependency only).
 
 ## Next
 
-Session 2, after YK's go-ahead.
+Session 3, after YK's go-ahead.

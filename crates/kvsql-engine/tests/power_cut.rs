@@ -45,6 +45,7 @@ fn power_cut_never_loses_or_tears_a_commit() {
     let mut image: Vec<u8> = Vec::new();
     let mut model = Model::new();
     let (mut landed_in_flight, mut lost_in_flight, mut mid_commit) = (0u64, 0u64, 0u64);
+    let mut reader_checks = 0u64;
 
     for round in 0..rounds {
         let ctx = format!("seed {seed} round {round}");
@@ -54,6 +55,12 @@ fn power_cut_never_loses_or_tears_a_commit() {
         db.verify()
             .unwrap_or_else(|e| panic!("{ctx}: verify after power cut: {e}"));
         assert_eq!(dump(&db), model, "{ctx}: contents after power cut");
+
+        // Half the rounds keep a reader open across the commits, so freed
+        // pages it can still reach must stay untouched.
+        let mut reader = rng
+            .chance(50)
+            .then(|| (db.begin_read().unwrap(), model.clone()));
 
         // Power fails after 0..80 more writes or syncs, or not at all.
         if rng.chance(85) {
@@ -69,7 +76,16 @@ fn power_cut_never_loses_or_tears_a_commit() {
             };
             apply_txn(&mut rng, &mut tx, &mut next);
             match tx.commit() {
-                Ok(()) => model = next,
+                Ok(()) => {
+                    model = next;
+                    if let Some((r, seen)) = reader.as_mut() {
+                        assert_eq!(&dump_read(r), seen, "{ctx}: open reader's view changed");
+                        reader_checks += 1;
+                    }
+                    if rng.chance(30) {
+                        reader = Some((db.begin_read().unwrap(), model.clone()));
+                    }
+                }
                 Err(Error::Io(_)) => {
                     in_flight = Some(next);
                     mid_commit += 1;
@@ -82,6 +98,7 @@ fn power_cut_never_loses_or_tears_a_commit() {
         if in_flight.is_some() {
             assert!(matches!(db.get("alpha", b"x"), Err(Error::Poisoned)));
         }
+        drop(reader);
         drop(db);
         image = storage.crash_image(&mut rng);
 
@@ -107,13 +124,15 @@ fn power_cut_never_loses_or_tears_a_commit() {
     }
     eprintln!(
         "power_cut: {rounds} rounds, {mid_commit} cuts inside a commit \
-         ({landed_in_flight} in-flight commits landed whole, {lost_in_flight} rolled back whole)"
+         ({landed_in_flight} in-flight commits landed whole, {lost_in_flight} rolled back whole), \
+         {reader_checks} checks of a reader held across commits"
     );
     assert!(
         mid_commit > rounds / 4,
         "too few cuts landed inside a commit"
     );
     assert!(landed_in_flight > 0 && lost_in_flight > 0);
+    assert!(reader_checks > 0);
 }
 
 #[test]

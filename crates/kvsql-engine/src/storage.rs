@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 /// Positional reads and writes plus a durability barrier.
 ///
 /// `sync` must not return until every earlier `write_at` is durable.
-pub trait Storage: Send {
+pub trait Storage: Send + Sync {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()>;
     fn write_at(&self, offset: u64, data: &[u8]) -> io::Result<()>;
     fn sync(&self) -> io::Result<()>;

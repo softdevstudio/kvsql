@@ -39,7 +39,7 @@ mod tree;
 #[doc(hidden)]
 pub mod sim;
 
-pub use db::{Db, Options, VerifyReport, WriteTx};
+pub use db::{Db, Options, ReadTx, VerifyReport, WriteTx};
 pub use error::{Error, Result};
 pub use storage::{FileStorage, Storage};
 pub use tree::{MAX_KEY_LEN, MAX_VALUE_LEN};

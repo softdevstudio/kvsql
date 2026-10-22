@@ -41,6 +41,8 @@ On open, the valid meta page with the highest transaction id wins.
 
 A crash before step 4 completes leaves the previous meta page as the newest valid one, and everything it points to is untouched. Pages a transaction stops using go on the free list only for the commit after it, because the previous commit still points at them.
 
+In memory, each free page is tagged with the commit that stopped using it. A page freed by commit T is handed out again only when no open reader holds a snapshot older than T. The tag is not stored in the file: after a reopen no reader exists, so every listed page is free at once.
+
 ## Trees
 
 Each keyspace is a B+tree. A directory tree maps keyspace names to their root page numbers (an 8-byte value; 0 means an empty keyspace).

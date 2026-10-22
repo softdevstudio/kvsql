@@ -1,12 +1,18 @@
-//! The database handle, write transactions, commit and recovery.
+//! The database handle, read and write transactions, commit and recovery.
 //!
 //! File layout: pages 0 and 1 are meta pages, written alternately. A commit
 //! writes every new page, syncs, then writes the meta page for the new
 //! transaction id and syncs again. Opening the file picks the valid meta page
 //! with the highest transaction id, so a commit is either fully visible or
 //! not visible at all.
+//!
+//! Readers work on a snapshot: the tree as of one commit. Committed pages are
+//! never changed in place, so a snapshot stays valid while the writer works,
+//! as long as no page it can reach is reused. A page that commit T stops
+//! using is tagged with T and reused only once no reader holds a snapshot
+//! older than T.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -21,6 +27,7 @@ const MAGIC: &[u8; 8] = b"KVSQLDB\0";
 const FORMAT_VERSION: u32 = 1;
 const FREE_HDR: usize = HEADER + 12;
 const FREE_PER_PAGE: usize = (PAGE_SIZE - FREE_HDR) / 8;
+const CACHE_SHARDS: usize = 16;
 
 /// Tuning knobs for [`Db::open_with`].
 #[derive(Clone, Debug)]
@@ -85,50 +92,81 @@ impl Meta {
     }
 }
 
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Page cache, split into shards so readers on different threads rarely
+/// wait on each other.
 struct Cache {
-    map: HashMap<u64, Page>,
-    cap: usize,
+    shards: Vec<Mutex<HashMap<u64, Page>>>,
+    cap_per_shard: usize,
 }
 
 impl Cache {
-    fn get(&self, id: u64) -> Option<Page> {
-        self.map.get(&id).cloned()
+    fn new(cap: usize) -> Cache {
+        Cache {
+            shards: (0..CACHE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            cap_per_shard: cap.div_ceil(CACHE_SHARDS),
+        }
     }
-    fn insert(&mut self, id: u64, p: Page) {
-        if self.cap == 0 {
+    fn shard(&self, id: u64) -> &Mutex<HashMap<u64, Page>> {
+        &self.shards[(id as usize) % CACHE_SHARDS]
+    }
+    fn get(&self, id: u64) -> Option<Page> {
+        lock(self.shard(id)).get(&id).cloned()
+    }
+    fn insert(&self, id: u64, p: Page) {
+        if self.cap_per_shard == 0 {
             return;
         }
-        if self.map.len() >= self.cap && !self.map.contains_key(&id) {
-            let drop: Vec<u64> = self.map.keys().take(self.cap / 4 + 1).copied().collect();
+        let mut m = lock(self.shard(id));
+        if m.len() >= self.cap_per_shard && !m.contains_key(&id) {
+            let drop: Vec<u64> = m.keys().take(self.cap_per_shard / 4 + 1).copied().collect();
             for k in drop {
-                self.map.remove(&k);
+                m.remove(&k);
             }
         }
-        self.map.insert(id, p);
+        m.insert(id, p);
     }
-    fn remove(&mut self, id: u64) {
-        self.map.remove(&id);
+    fn remove(&self, id: u64) {
+        lock(self.shard(id)).remove(&id);
     }
 }
 
-struct Inner {
-    store: Box<dyn Storage>,
-    cache: Cache,
+/// A free page and the commit that stopped using it.
+#[derive(Clone, Copy, Debug)]
+struct Free {
+    id: u64,
+    freed_at: u64,
+}
+
+/// Committed state, changed only by a commit.
+struct State {
     meta: Meta,
     /// Pages holding the persisted free list (reachable from `meta`).
     free_pages: Vec<u64>,
-    /// Page ids the persisted free list says are unused.
-    free_ids: Vec<u64>,
+    free: Vec<Free>,
+    /// Open read snapshots: commit id -> how many readers hold it.
+    readers: BTreeMap<u64, usize>,
     poisoned: bool,
 }
 
-impl PageRead for Inner {
-    fn read(&mut self, id: u64) -> Result<Page> {
-        if id < 2 || id >= self.meta.page_count {
-            return corrupt(format!(
-                "page {id} is outside the file ({} pages)",
-                self.meta.page_count
-            ));
+struct Shared {
+    store: Box<dyn Storage>,
+    cache: Cache,
+    state: Mutex<State>,
+    /// Held for the life of a write transaction.
+    writer: Mutex<()>,
+}
+
+impl Shared {
+    /// Read a committed page. `limit` is the page count of the snapshot.
+    fn read_page(&self, id: u64, limit: u64) -> Result<Page> {
+        if id < 2 || id >= limit {
+            return corrupt(format!("page {id} is outside the file ({limit} pages)"));
         }
         if let Some(p) = self.cache.get(id) {
             return Ok(p);
@@ -139,21 +177,6 @@ impl PageRead for Inner {
         let p: Page = buf.into();
         self.cache.insert(id, p.clone());
         Ok(p)
-    }
-}
-
-impl Inner {
-    fn check(&self) -> Result<()> {
-        if self.poisoned {
-            Err(Error::Poisoned)
-        } else {
-            Ok(())
-        }
-    }
-
-    fn ks_root(&mut self, name: &[u8]) -> Result<Option<u64>> {
-        let dir = self.meta.dir_root;
-        lookup_root(self, dir, name)
     }
 }
 
@@ -193,6 +216,22 @@ fn collect<R: PageRead>(
         .collect()
 }
 
+fn get_value<R: PageRead>(r: &mut R, root: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
+    match tree::get(r, root, key)? {
+        None => Ok(None),
+        Some(v) => Ok(Some(tree::read_value(r, v)?)),
+    }
+}
+
+fn list_keyspaces<R: PageRead>(r: &mut R, dir_root: u64) -> Result<Vec<String>> {
+    let mut raw = Vec::new();
+    tree::scan(r, dir_root, &[], None, usize::MAX, &mut raw)?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+        .collect())
+}
+
 /// What [`Db::verify`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyReport {
@@ -206,11 +245,11 @@ pub struct VerifyReport {
 
 /// An open database file.
 ///
-/// All methods take `&self`; the handle can be shared between threads.
-/// One write transaction runs at a time, and it blocks reads made through
-/// the handle until it commits or is dropped.
+/// All methods take `&self`, and the handle can be shared between threads.
+/// One write transaction runs at a time. Readers never wait for it: each
+/// read works on the last commit made before it started.
 pub struct Db {
-    inner: Mutex<Inner>,
+    shared: Shared,
 }
 
 impl Db {
@@ -255,24 +294,27 @@ impl Db {
             }
             None => return corrupt("no valid meta page"),
         };
-        let mut inner = Inner {
+        let shared = Shared {
             store,
-            cache: Cache {
-                map: HashMap::new(),
-                cap: opts.cache_pages,
-            },
-            meta,
-            free_pages: Vec::new(),
-            free_ids: Vec::new(),
-            poisoned: false,
+            cache: Cache::new(opts.cache_pages),
+            state: Mutex::new(State {
+                meta,
+                free_pages: Vec::new(),
+                free: Vec::new(),
+                readers: BTreeMap::new(),
+                poisoned: false,
+            }),
+            writer: Mutex::new(()),
         };
-        // Load the free list.
+        // Load the free list. Nobody holds a snapshot yet, so every listed
+        // page is free to reuse at once.
+        let (mut free_pages, mut free) = (Vec::new(), Vec::new());
         let mut id = meta.free_head;
         while id != 0 {
-            if inner.free_pages.len() as u64 > meta.page_count {
+            if free_pages.len() as u64 > meta.page_count {
                 return corrupt("free list loops");
             }
-            let p = inner.read(id)?;
+            let p = shared.read_page(id, meta.page_count)?;
             if page::page_type(&p) != PageType::Free as u8 {
                 return corrupt("free list points at a non-free-list page");
             }
@@ -281,43 +323,48 @@ impl Db {
                 return corrupt("free list page overfull");
             }
             for j in 0..n {
-                inner.free_ids.push(get_u64(&p, FREE_HDR + 8 * j));
+                free.push(Free {
+                    id: get_u64(&p, FREE_HDR + 8 * j),
+                    freed_at: 0,
+                });
             }
-            inner.free_pages.push(id);
+            free_pages.push(id);
             id = get_u64(&p, HEADER);
         }
-        if inner.free_ids.len() as u64 != meta.free_count {
+        if free.len() as u64 != meta.free_count {
             return corrupt("free list length does not match meta page");
         }
-        Ok(Db {
-            inner: Mutex::new(inner),
-        })
-    }
-
-    fn lock(&self) -> Result<MutexGuard<'_, Inner>> {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.check()?;
-        Ok(g)
+        {
+            let mut st = lock(&shared.state);
+            st.free_pages = free_pages;
+            st.free = free;
+        }
+        Ok(Db { shared })
     }
 
     /// Id of the last committed transaction.
     pub fn txid(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .meta
-            .txid
+        lock(&self.shared.state).meta.txid
+    }
+
+    /// Start a read transaction: a stable view of the last commit. It sees
+    /// nothing committed after it began. Pages it can reach are not reused
+    /// while it lives, so long-lived readers make the file grow.
+    pub fn begin_read(&self) -> Result<ReadTx<'_>> {
+        let mut st = lock(&self.shared.state);
+        if st.poisoned {
+            return Err(Error::Poisoned);
+        }
+        let meta = st.meta;
+        *st.readers.entry(meta.txid).or_insert(0) += 1;
+        Ok(ReadTx {
+            shared: &self.shared,
+            meta,
+        })
     }
 
     pub fn get(&self, keyspace: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut g = self.lock()?;
-        let Some(root) = g.ks_root(keyspace.as_bytes())? else {
-            return Ok(None);
-        };
-        match tree::get(&mut *g, root, key)? {
-            None => Ok(None),
-            Some(v) => Ok(Some(tree::read_value(&mut *g, v)?)),
-        }
+        self.begin_read()?.get(keyspace, key)
     }
 
     /// Pairs with `from <= key < to` (no upper bound when `to` is `None`),
@@ -329,23 +376,12 @@ impl Db {
         to: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let mut g = self.lock()?;
-        let Some(root) = g.ks_root(keyspace.as_bytes())? else {
-            return Ok(Vec::new());
-        };
-        collect(&mut *g, root, from, to, limit)
+        self.begin_read()?.scan(keyspace, from, to, limit)
     }
 
     /// Names of all keyspaces, in byte order.
     pub fn keyspaces(&self) -> Result<Vec<String>> {
-        let mut g = self.lock()?;
-        let dir = g.meta.dir_root;
-        let mut raw = Vec::new();
-        tree::scan(&mut *g, dir, &[], None, usize::MAX, &mut raw)?;
-        Ok(raw
-            .into_iter()
-            .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
-            .collect())
+        self.begin_read()?.keyspaces()
     }
 
     /// Put one pair in its own transaction.
@@ -363,36 +399,69 @@ impl Db {
         Ok(found)
     }
 
-    /// Start a write transaction. Nothing reaches the file until `commit`;
-    /// dropping the transaction discards it.
+    /// Start a write transaction. Waits while another one is open. Nothing
+    /// reaches the file until `commit`; dropping the transaction discards it.
     pub fn begin_write(&self) -> Result<WriteTx<'_>> {
-        let g = self.lock()?;
-        let mut reusable = g.free_ids.clone();
+        let guard = lock(&self.shared.writer);
+        let st = lock(&self.shared.state);
+        if st.poisoned {
+            return Err(Error::Poisoned);
+        }
+        // Pages freed by commit T are safe once every reader is at T or later.
+        let oldest = st.readers.keys().next().copied().unwrap_or(u64::MAX);
+        let (mut reusable, mut held) = (Vec::new(), Vec::new());
+        for f in &st.free {
+            if f.freed_at <= oldest {
+                reusable.push(f.id);
+            } else {
+                held.push(*f);
+            }
+        }
         reusable.sort_unstable_by(|a, b| b.cmp(a));
-        let page_count = g.meta.page_count;
-        let dir_root = g.meta.dir_root;
+        let base = st.meta;
+        let old_free_pages = st.free_pages.clone();
+        drop(st);
         Ok(WriteTx {
-            inner: g,
+            shared: &self.shared,
+            _guard: guard,
+            base,
+            old_free_pages,
             dirty: HashMap::new(),
             fresh: HashSet::new(),
             reusable,
+            held,
             pending: Vec::new(),
-            page_count,
-            dir_root,
+            page_count: base.page_count,
+            dir_root: base.dir_root,
             roots: HashMap::new(),
             changed: Vec::new(),
         })
     }
 
-    /// Check every page and invariant in the file.
+    /// Check every page and invariant in the file. Waits for any write
+    /// transaction to finish and holds off new ones while it runs.
     pub fn verify(&self) -> Result<VerifyReport> {
-        let mut g = self.lock()?;
-        let meta = g.meta;
+        let _w = lock(&self.shared.writer);
+        let (meta, free_pages, free_list) = {
+            let st = lock(&self.shared.state);
+            if st.poisoned {
+                return Err(Error::Poisoned);
+            }
+            (st.meta, st.free_pages.clone(), st.free.clone())
+        };
+        let mut r = ReadTx {
+            shared: &self.shared,
+            meta,
+        };
+        *lock(&self.shared.state)
+            .readers
+            .entry(meta.txid)
+            .or_insert(0) += 1;
         let mut seen: HashSet<u64> = HashSet::from([0, 1]);
         let mut dir_stats = TreeStats::default();
-        tree::verify(&mut *g, meta.dir_root, &mut seen, &mut dir_stats)?;
+        tree::verify(&mut r, meta.dir_root, &mut seen, &mut dir_stats)?;
         let mut entries = Vec::new();
-        tree::scan(&mut *g, meta.dir_root, &[], None, usize::MAX, &mut entries)?;
+        tree::scan(&mut r, meta.dir_root, &[], None, usize::MAX, &mut entries)?;
         let mut keys = 0;
         for (name, v) in &entries {
             let root = match v {
@@ -402,26 +471,26 @@ impl Db {
                 _ => return corrupt("directory entry is not a page id"),
             };
             let mut st = TreeStats::default();
-            tree::verify(&mut *g, root, &mut seen, &mut st).map_err(|e| {
+            tree::verify(&mut r, root, &mut seen, &mut st).map_err(|e| {
                 Error::Corrupt(format!("keyspace {:?}: {e}", String::from_utf8_lossy(name)))
             })?;
             keys += st.keys;
         }
-        for &fp in &g.free_pages.clone() {
+        for &fp in &free_pages {
             if !seen.insert(fp) {
                 return corrupt(format!("free list page {fp} is also in use"));
             }
         }
         let mut free = HashSet::new();
-        for &f in &g.free_ids {
-            if f < 2 || f >= meta.page_count {
-                return corrupt(format!("free page {f} is outside the file"));
+        for f in &free_list {
+            if f.id < 2 || f.id >= meta.page_count {
+                return corrupt(format!("free page {} is outside the file", f.id));
             }
-            if seen.contains(&f) {
-                return corrupt(format!("page {f} is both free and in use"));
+            if seen.contains(&f.id) {
+                return corrupt(format!("page {} is both free and in use", f.id));
             }
-            if !free.insert(f) {
-                return corrupt(format!("page {f} is listed free twice"));
+            if !free.insert(f.id) {
+                return corrupt(format!("page {} is listed free twice", f.id));
             }
         }
         let accounted = seen.len() as u64 + free.len() as u64;
@@ -442,18 +511,82 @@ impl Db {
     }
 }
 
+/// A read transaction. See [`Db::begin_read`].
+pub struct ReadTx<'a> {
+    shared: &'a Shared,
+    meta: Meta,
+}
+
+impl PageRead for ReadTx<'_> {
+    fn read(&mut self, id: u64) -> Result<Page> {
+        self.shared.read_page(id, self.meta.page_count)
+    }
+}
+
+impl Drop for ReadTx<'_> {
+    fn drop(&mut self) {
+        let mut st = lock(&self.shared.state);
+        if let Some(n) = st.readers.get_mut(&self.meta.txid) {
+            *n -= 1;
+            if *n == 0 {
+                st.readers.remove(&self.meta.txid);
+            }
+        }
+    }
+}
+
+impl ReadTx<'_> {
+    /// The commit this transaction sees.
+    pub fn txid(&self) -> u64 {
+        self.meta.txid
+    }
+
+    pub fn get(&mut self, keyspace: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let dir = self.meta.dir_root;
+        let Some(root) = lookup_root(self, dir, keyspace.as_bytes())? else {
+            return Ok(None);
+        };
+        get_value(self, root, key)
+    }
+
+    /// Same as [`Db::scan`], on this snapshot.
+    pub fn scan(
+        &mut self,
+        keyspace: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let dir = self.meta.dir_root;
+        let Some(root) = lookup_root(self, dir, keyspace.as_bytes())? else {
+            return Ok(Vec::new());
+        };
+        collect(self, root, from, to, limit)
+    }
+
+    pub fn keyspaces(&mut self) -> Result<Vec<String>> {
+        let dir = self.meta.dir_root;
+        list_keyspaces(self, dir)
+    }
+}
+
 /// A write transaction. See [`Db::begin_write`].
 pub struct WriteTx<'a> {
-    inner: MutexGuard<'a, Inner>,
-    /// New page bodies, sealed, not yet in the file.
+    shared: &'a Shared,
+    _guard: MutexGuard<'a, ()>,
+    base: Meta,
+    old_free_pages: Vec<u64>,
+    /// New page bodies, not yet sealed or in the file.
     dirty: HashMap<u64, Page>,
-    /// Pages allocated by this transaction. They are reachable from no
-    /// committed state, so they can be freed and reused at once.
+    /// Pages allocated by this transaction. No committed state reaches them,
+    /// so they can be freed and reused at once.
     fresh: HashSet<u64>,
-    /// Free pages safe to reuse now.
+    /// Free pages safe to overwrite now.
     reusable: Vec<u64>,
-    /// Committed pages this transaction stopped using. Still reachable from
-    /// the last commit, so reusable only after this one lands.
+    /// Free pages an open reader may still reach.
+    held: Vec<Free>,
+    /// Committed pages this transaction stopped using. The last commit, and
+    /// readers on it, still reach them.
     pending: Vec<u64>,
     page_count: u64,
     dir_root: u64,
@@ -467,7 +600,7 @@ impl PageRead for WriteTx<'_> {
         if let Some(p) = self.dirty.get(&id) {
             return Ok(p.clone());
         }
-        self.inner.read(id)
+        self.shared.read_page(id, self.base.page_count)
     }
 }
 
@@ -525,10 +658,7 @@ impl WriteTx<'_> {
         let Some(root) = self.root_of(keyspace.as_bytes())? else {
             return Ok(None);
         };
-        match tree::get(self, root, key)? {
-            None => Ok(None),
-            Some(v) => Ok(Some(tree::read_value(self, v)?)),
-        }
+        get_value(self, root, key)
     }
 
     pub fn scan(
@@ -596,6 +726,22 @@ impl WriteTx<'_> {
         Ok(true)
     }
 
+    /// Names of all keyspaces as this transaction sees them.
+    pub fn keyspaces(&mut self) -> Result<Vec<String>> {
+        let dir = self.dir_root;
+        let mut names: Vec<String> = list_keyspaces(self, dir)?;
+        for (name, root) in &self.roots {
+            let n = String::from_utf8_lossy(name).into_owned();
+            match root {
+                Some(_) if !names.contains(&n) => names.push(n),
+                None => names.retain(|x| *x != n),
+                _ => {}
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
     /// Make every change durable, all at once.
     pub fn commit(mut self) -> Result<()> {
         if self.changed.is_empty() && self.dirty.is_empty() && self.pending.is_empty() {
@@ -623,14 +769,16 @@ impl WriteTx<'_> {
         }
 
         // The old free-list pages stop being needed once this commit lands.
-        let old_free_pages = self.inner.free_pages.clone();
+        // Readers never touch them, but the last commit does.
+        let old_free_pages = std::mem::take(&mut self.old_free_pages);
         self.pending.extend(old_free_pages);
+        let txid = self.base.txid + 1;
 
         // Pick pages for the new free list from pages that are safe to
         // overwrite now. Taking a page shrinks the list, so loop.
         let mut list_pages = Vec::new();
         loop {
-            let total = self.reusable.len() + self.pending.len();
+            let total = self.reusable.len() + self.held.len() + self.pending.len();
             if total.div_ceil(FREE_PER_PAGE) <= list_pages.len() {
                 break;
             }
@@ -642,13 +790,15 @@ impl WriteTx<'_> {
                 }
             }
         }
-        let mut ids: Vec<u64> = self
+        let mut free: Vec<Free> = self
             .reusable
             .iter()
-            .chain(self.pending.iter())
-            .copied()
+            .map(|&id| Free { id, freed_at: 0 })
+            .chain(self.held.iter().copied())
+            .chain(self.pending.iter().map(|&id| Free { id, freed_at: txid }))
             .collect();
-        ids.sort_unstable();
+        free.sort_unstable_by_key(|f| f.id);
+        let ids: Vec<u64> = free.iter().map(|f| f.id).collect();
         let mut list_bodies = Vec::new();
         let chunks: Vec<&[u64]> = ids.chunks(FREE_PER_PAGE).collect();
         for (i, &pid) in list_pages.iter().enumerate() {
@@ -664,7 +814,7 @@ impl WriteTx<'_> {
         }
 
         let meta = Meta {
-            txid: self.inner.meta.txid + 1,
+            txid,
             dir_root: self.dir_root,
             page_count: self.page_count,
             free_head: list_pages.first().copied().unwrap_or(0),
@@ -680,38 +830,39 @@ impl WriteTx<'_> {
             })
             .collect();
         writes.sort_unstable_by_key(|(id, _)| *id);
+        let store = &self.shared.store;
         let result = (|| -> Result<()> {
             for (id, p) in &writes {
-                self.inner.store.write_at(id * PAGE_SIZE as u64, p)?;
+                store.write_at(id * PAGE_SIZE as u64, p)?;
             }
             for (id, p) in &list_bodies {
-                self.inner.store.write_at(id * PAGE_SIZE as u64, p)?;
+                store.write_at(id * PAGE_SIZE as u64, p)?;
             }
-            self.inner.store.sync()?;
+            store.sync()?;
             let slot = meta.txid % 2;
-            self.inner
-                .store
-                .write_at(slot * PAGE_SIZE as u64, &meta.encode(slot))?;
-            self.inner.store.sync()?;
+            store.write_at(slot * PAGE_SIZE as u64, &meta.encode(slot))?;
+            store.sync()?;
             Ok(())
         })();
         if let Err(e) = result {
             // The file may hold a partial commit. Reopening recovers the last
             // good state; this handle must not guess.
-            self.inner.poisoned = true;
+            lock(&self.shared.state).poisoned = true;
             return Err(e);
         }
 
-        let inner = &mut *self.inner;
+        // No reader can reach a page written here, so the cache can take
+        // the new contents before the new meta is visible to readers.
         for (id, p) in writes {
-            inner.cache.insert(id, p);
+            self.shared.cache.insert(id, p);
         }
         for (id, _) in &list_bodies {
-            inner.cache.remove(*id);
+            self.shared.cache.remove(*id);
         }
-        inner.meta = meta;
-        inner.free_pages = list_pages;
-        inner.free_ids = ids;
+        let mut st = lock(&self.shared.state);
+        st.meta = meta;
+        st.free_pages = list_pages;
+        st.free = free;
         Ok(())
     }
 }

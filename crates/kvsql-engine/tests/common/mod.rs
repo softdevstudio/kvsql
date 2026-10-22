@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use kvsql_engine::sim::Rng;
-use kvsql_engine::Db;
+use kvsql_engine::{Db, ReadTx};
 
 pub type Model = BTreeMap<(String, Vec<u8>), Vec<u8>>;
 
@@ -13,6 +13,17 @@ pub fn dump(db: &Db) -> Model {
     let mut out = Model::new();
     for ks in db.keyspaces().unwrap() {
         for (k, v) in db.scan(&ks, b"", None, usize::MAX).unwrap() {
+            out.insert((ks.clone(), k), v);
+        }
+    }
+    out
+}
+
+/// Everything a read transaction sees.
+pub fn dump_read(r: &mut ReadTx<'_>) -> Model {
+    let mut out = Model::new();
+    for ks in r.keyspaces().unwrap() {
+        for (k, v) in r.scan(&ks, b"", None, usize::MAX).unwrap() {
             out.insert((ks.clone(), k), v);
         }
     }
