@@ -36,15 +36,39 @@ impl Table {
     }
 }
 
-/// Table definitions looked up in one transaction.
+pub type SchemaMap = HashMap<String, Option<Arc<Table>>>;
+
+/// Table definitions looked up in one transaction: a shared map handed over
+/// by the database when the schema has not changed since it was built, plus
+/// what this transaction looked up itself.
 #[derive(Default)]
 pub struct SchemaCache {
-    map: HashMap<String, Option<Arc<Table>>>,
+    base: Option<Arc<SchemaMap>>,
+    map: SchemaMap,
 }
 
 impl SchemaCache {
+    pub fn with_base(base: Option<Arc<SchemaMap>>) -> SchemaCache {
+        SchemaCache {
+            base,
+            map: SchemaMap::new(),
+        }
+    }
     pub fn clear(&mut self) {
+        self.base = None;
         self.map.clear();
+    }
+    fn get(&self, name: &str) -> Option<&Option<Arc<Table>>> {
+        self.map
+            .get(name)
+            .or_else(|| self.base.as_ref().and_then(|b| b.get(name)))
+    }
+    /// The shared map and the entries this transaction added to it, if any.
+    pub fn learned(&mut self) -> Option<(Option<Arc<SchemaMap>>, SchemaMap)> {
+        if self.map.is_empty() {
+            return None;
+        }
+        Some((self.base.take(), std::mem::take(&mut self.map)))
     }
 }
 
@@ -134,7 +158,7 @@ fn plain_table(name: &str) -> Table {
 
 /// The table called `name`: a defined table, a plain keyspace, or none.
 pub fn table<K: Kv>(kv: &mut K, name: &str) -> Result<Option<Arc<Table>>> {
-    if let Some(t) = kv.schemas().map.get(name) {
+    if let Some(t) = kv.schemas().get(name) {
         return Ok(t.clone());
     }
     let t = load(kv, name)?.map(Arc::new);

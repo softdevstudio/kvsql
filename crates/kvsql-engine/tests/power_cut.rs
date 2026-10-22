@@ -62,9 +62,11 @@ fn power_cut_never_loses_or_tears_a_commit() {
             .chance(50)
             .then(|| (db.begin_read().unwrap(), model.clone()));
 
-        // Power fails after 0..80 more writes or syncs, or not at all.
+        // Power fails after 0..24 more writes or syncs, or not at all.
+        // Consecutive pages go out in one write, so a commit is a handful
+        // of writes and two syncs.
         if rng.chance(85) {
-            storage.fail_after(rng.below(80));
+            storage.fail_after(rng.below(24));
         }
         let mut in_flight: Option<Model> = None;
         for _ in 0..1 + rng.below(4) {
@@ -206,7 +208,7 @@ fn power_cut_during_sql_keeps_indexes_exact() {
 
         let storage = SimStorage::from_image(image.clone());
         let db = Db::open_with(Box::new(storage.clone()), Options::default()).unwrap();
-        storage.fail_after(rng.below(40));
+        storage.fail_after(rng.below(12));
         let r = db.execute(&stmt, &[]);
         drop(db);
         if matches!(r, Err(Error::Io(_))) {

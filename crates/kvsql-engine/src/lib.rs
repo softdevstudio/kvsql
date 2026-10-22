@@ -47,6 +47,7 @@
 mod crc32;
 mod db;
 mod error;
+mod idhash;
 mod page;
 pub mod sql;
 mod storage;

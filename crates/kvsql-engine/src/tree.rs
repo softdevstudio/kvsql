@@ -324,15 +324,17 @@ fn encode(node: &Node) -> Vec<u8> {
     }
 }
 
-/// Byte-balanced split points: each chunk fits a page and none is tiny
-/// unless the whole node is.
-fn chunk_bounds(sizes: &[usize]) -> Vec<(usize, usize)> {
+/// Split points: each chunk fits a page. Balanced splits keep every chunk
+/// near the same size. When keys arrive in order at the end of a node,
+/// `fill_left` packs the earlier pages full instead, so a run of appends
+/// leaves full pages behind it rather than half-empty ones.
+fn chunk_bounds(sizes: &[usize], fill_left: bool) -> Vec<(usize, usize)> {
     let total: usize = sizes.iter().sum();
     if total <= CAPACITY {
         return vec![(0, sizes.len())];
     }
     let parts = total.div_ceil(CAPACITY);
-    let target = total / parts;
+    let target = if fill_left { CAPACITY } else { total / parts };
     let mut out = Vec::new();
     let (mut start, mut acc) = (0, 0);
     for (i, &s) in sizes.iter().enumerate() {
@@ -356,6 +358,15 @@ struct Written {
 
 /// Free `olds`, then write `node` into as many new pages as it needs.
 fn write_node<W: PageWrite>(w: &mut W, olds: &[u64], node: Node) -> Vec<Written> {
+    write_node_as(w, olds, node, false)
+}
+
+fn write_node_as<W: PageWrite>(
+    w: &mut W,
+    olds: &[u64],
+    node: Node,
+    fill_left: bool,
+) -> Vec<Written> {
     for &o in olds {
         w.free(o);
     }
@@ -363,7 +374,7 @@ fn write_node<W: PageWrite>(w: &mut W, olds: &[u64], node: Node) -> Vec<Written>
     match node {
         Node::Leaf(cells) => {
             let sizes: Vec<usize> = cells.iter().map(leaf_cell_size).collect();
-            let bounds = chunk_bounds(&sizes);
+            let bounds = chunk_bounds(&sizes, fill_left);
             let mut cells = cells;
             for &(a, b) in bounds.iter().rev() {
                 let chunk: Vec<LeafCell> = cells.drain(a..b).collect();
@@ -376,7 +387,7 @@ fn write_node<W: PageWrite>(w: &mut W, olds: &[u64], node: Node) -> Vec<Written>
         }
         Node::Branch(cells) => {
             let sizes: Vec<usize> = cells.iter().map(branch_cell_size).collect();
-            let bounds = chunk_bounds(&sizes);
+            let bounds = chunk_bounds(&sizes, fill_left);
             let mut cells = cells;
             for &(a, b) in bounds.iter().rev() {
                 let mut chunk: Vec<BranchCell> = cells.drain(a..b).collect();
@@ -577,17 +588,21 @@ fn ins<W: PageWrite>(
         let Node::Leaf(mut cells) = decode(&p)? else {
             unreachable!()
         };
+        let mut append = false;
         match cells.binary_search_by(|c| c.key.as_slice().cmp(key)) {
             Ok(i) => cells[i].val = val,
-            Err(i) => cells.insert(
-                i,
-                LeafCell {
-                    key: key.to_vec(),
-                    val,
-                },
-            ),
+            Err(i) => {
+                append = i == cells.len();
+                cells.insert(
+                    i,
+                    LeafCell {
+                        key: key.to_vec(),
+                        val,
+                    },
+                )
+            }
         }
-        return Ok((write_node(w, &[id], Node::Leaf(cells)), old));
+        return Ok((write_node_as(w, &[id], Node::Leaf(cells), append), old));
     }
     if n == 0 {
         return corrupt("empty branch page");
@@ -610,8 +625,9 @@ fn ins<W: PageWrite>(
     let Node::Branch(mut cells) = decode(&p)? else {
         unreachable!()
     };
+    let append = i == cells.len() - 1 && kids.len() > 1;
     splice(&mut cells, i, 1, kids);
-    Ok((write_node(w, &[id], Node::Branch(cells)), old))
+    Ok((write_node_as(w, &[id], Node::Branch(cells), append), old))
 }
 
 /// Replace `count` cells at `at` with `pages`. The first page keeps the

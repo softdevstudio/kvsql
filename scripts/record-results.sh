@@ -10,6 +10,7 @@
 #   KVSQL_SQL_STMTS    random SQL checked vs SQLite    (default here 30000)
 #   KVSQL_SERVER_SECS  concurrent HTTP clients run     (default here 10)
 #   KVSQL_SERVER_KILLS kvsqld SIGKILLs under load      (default here 100)
+#   KVSQL_BENCH_ROWS   rows in the SQLite benchmark   (default 100000)
 #   KVSQL_SEED         replay one seed
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -43,4 +44,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release -- --nocapture --test-threads=1
 
-printf 'PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests\n'
+# Benchmark against SQLite, saved on its own for the site.
+cargo run --release -q -p kvsql-engine --example bench | tee "$result_path/bench.md"
+
+printf 'PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests; benchmark saved to bench.md\n'

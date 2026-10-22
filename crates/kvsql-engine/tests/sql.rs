@@ -379,3 +379,139 @@ fn errors_name_the_problem() {
     assert!(msg("SELECT count(*) FROM people WHERE count(*) > 1").contains("aggregate"));
     assert!(msg("SELECT 1 FROM people WHERE id = ?").contains("parameters"));
 }
+
+/// Many statements in one big transaction, a third of them failing part way
+/// through after they have already written pages. Each failure must leave
+/// exactly the state before it, and the committed file must verify.
+#[test]
+fn failing_statements_in_a_long_transaction_undo_exactly() {
+    use kvsql_engine::sim::Rng;
+    use std::collections::BTreeMap;
+    let db = db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL, g INTEGER);
+         CREATE INDEX t_g ON t(g)",
+        &[],
+    )
+    .unwrap();
+    let mut rng = Rng::new(99);
+    let mut model: BTreeMap<i64, (String, i64)> = BTreeMap::new();
+    let mut tx = db.begin_write().unwrap();
+    for round in 0..600 {
+        let base = rng.below(3000) as i64;
+        let n = 1 + rng.below(40) as i64;
+        let fail = rng.below(3) == 0;
+        let big = "x".repeat(rng.below(2500) as usize);
+        let mut values: Vec<String> = (0..n)
+            .map(|k| format!("({}, '{big}{round}', {})", base + k * 7, (base + k) % 13))
+            .collect();
+        if fail {
+            // The first row again: a primary key clash after the other rows were written.
+            values.push(format!("({base}, 'dup', 1)"));
+        }
+        let ids: Vec<String> = (0..n).map(|k| (base + k * 7).to_string()).collect();
+        tx.execute(
+            &format!("DELETE FROM t WHERE id IN ({})", ids.join(", ")),
+            &[],
+        )
+        .unwrap();
+        for k in 0..n {
+            model.remove(&(base + k * 7));
+        }
+        let sql = format!("INSERT INTO t VALUES {}", values.join(", "));
+        let r = tx.execute(&sql, &[]);
+        if fail {
+            assert!(r.is_err(), "round {round} should fail");
+        } else {
+            r.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            for k in 0..n {
+                model.insert(base + k * 7, (format!("{big}{round}"), (base + k) % 13));
+            }
+        }
+        if round % 5 == 0 {
+            let lo = rng.below(3000) as i64;
+            let sql = format!("DELETE FROM t WHERE id >= {lo} AND id < {}", lo + 60);
+            if rng.below(2) == 0 {
+                tx.execute(&sql, &[]).unwrap();
+                model.retain(|k, _| *k < lo || *k >= lo + 60);
+            } else {
+                // A delete that is followed by a failing statement in the same call.
+                let bad = format!("{sql}; INSERT INTO t VALUES (1, NULL, 1)");
+                assert!(tx.execute(&bad, &[]).is_err());
+                // The DELETE before it in the same call stands.
+                model.retain(|k, _| *k < lo || *k >= lo + 60);
+            }
+        }
+        let r = tx.execute("SELECT count(*), sum(g) FROM t", &[]).unwrap();
+        let sum: i64 = model.values().map(|(_, g)| g).sum();
+        let want = if model.is_empty() {
+            vec![Value::Int(0), Value::Null]
+        } else {
+            vec![Value::Int(model.len() as i64), Value::Int(sum)]
+        };
+        assert_eq!(r.rows[0], want, "round {round}");
+    }
+    tx.commit().unwrap();
+    db.verify().unwrap();
+    for (id, (v, g)) in &model {
+        let row = db.get_row("t", &Value::Int(*id)).unwrap().unwrap();
+        assert_eq!(
+            row,
+            vec![Value::Int(*id), Value::Text(v.clone()), Value::Int(*g)]
+        );
+    }
+    let r = db.execute("SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(r.rows[0][0], Value::Int(model.len() as i64));
+}
+
+/// Table definitions are cached across transactions; creating or dropping
+/// a keyspace or table must show up at once, in the same transaction and
+/// in the next ones.
+#[test]
+fn schema_cache_follows_keyspace_and_table_changes() {
+    let db = db();
+    assert!(db.execute("SELECT count(*) FROM notes", &[]).is_err());
+    assert!(db.get_row("notes", &t("a")).unwrap_or(None).is_none());
+    let mut tx = db.begin_write().unwrap();
+    assert!(tx.execute("SELECT count(*) FROM notes", &[]).is_err());
+    tx.put("notes", b"a", b"1").unwrap();
+    assert_eq!(
+        tx.execute("SELECT count(*) FROM notes", &[]).unwrap().rows[0][0],
+        i(1)
+    );
+    tx.commit().unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM notes")[0][0], i(1));
+    let mut tx = db.begin_write().unwrap();
+    tx.drop_keyspace("notes").unwrap();
+    assert!(tx.execute("SELECT count(*) FROM notes", &[]).is_err());
+    tx.commit().unwrap();
+    assert!(db.execute("SELECT count(*) FROM notes", &[]).is_err());
+
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT)", &[])
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (1, 'x')", &[]).unwrap();
+    assert_eq!(db.get_row("p", &i(1)).unwrap().unwrap().len(), 2);
+    // A reader opened before a schema change keeps its own view.
+    let mut old = db.begin_read().unwrap();
+    db.execute(
+        "DROP TABLE p; CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT, b INTEGER)",
+        &[],
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1, 'y', 5)", &[]).unwrap();
+    assert_eq!(
+        old.get_row("p", &i(1)).unwrap().unwrap(),
+        vec![i(1), t("x")]
+    );
+    drop(old);
+    assert_eq!(
+        db.get_row("p", &i(1)).unwrap().unwrap(),
+        vec![i(1), t("y"), i(5)]
+    );
+    db.execute("CREATE INDEX p_b ON p(b)", &[]).unwrap();
+    let mut tx = db.begin_write().unwrap();
+    tx.put_row("p", &[i(2), t("z"), i(5)]).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(rows(&db, "SELECT count(*) FROM p WHERE b = 5")[0][0], i(2));
+    db.verify().unwrap();
+}

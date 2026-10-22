@@ -52,8 +52,10 @@ impl Storage for FileStorage {
     }
 
     fn sync(&self) -> io::Result<()> {
-        // sync_all also flushes the file length, which grows as pages are appended.
-        self.file.sync_all()
+        // fdatasync still flushes the file length when it grew, which is all
+        // the metadata a later read needs; the timestamps it skips are not.
+        // On macOS both calls use F_FULLFSYNC.
+        self.file.sync_data()
     }
 
     fn len(&self) -> io::Result<u64> {

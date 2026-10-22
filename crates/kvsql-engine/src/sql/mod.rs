@@ -21,8 +21,11 @@ mod value;
 
 pub use value::{decode_row, encode_row, ColType, Value};
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use crate::error::{Error, Result};
-pub(crate) use catalog::SchemaCache;
+pub(crate) use catalog::{SchemaCache, SchemaMap};
 
 /// The rows and columns a statement produced.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -72,13 +75,74 @@ pub(crate) trait KvWrite: Kv {
     fn mark(&mut self);
     /// Go back to the last `mark`.
     fn rollback(&mut self);
+    /// The work since the last `mark` stands; forget it.
+    fn release(&mut self);
+}
+
+/// Statements parsed once and kept for the next call with the same text.
+pub(crate) struct Parsed {
+    stmts: Vec<parser::Stmt>,
+    params: usize,
+    read_only: bool,
+}
+
+impl Parsed {
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only
+    }
+}
+
+/// Parsed statements by SQL text, shared by every transaction on a handle.
+/// Parsing does not look at the schema, so entries never go stale. The
+/// cache is emptied when it fills up.
+#[derive(Default)]
+pub(crate) struct StmtCache {
+    map: Mutex<HashMap<String, Arc<Parsed>>>,
+}
+
+const STMT_CACHE_SIZE: usize = 256;
+
+impl StmtCache {
+    pub(crate) fn parse(&self, sql: &str) -> Result<Arc<Parsed>> {
+        if let Some(p) = lock(&self.map).get(sql) {
+            return Ok(p.clone());
+        }
+        let (stmts, params) = parser::parse(sql)?;
+        let read_only = stmts.iter().all(|s| matches!(s, parser::Stmt::Select(_)));
+        let p = Arc::new(Parsed {
+            stmts,
+            params,
+            read_only,
+        });
+        let mut m = lock(&self.map);
+        if m.len() >= STMT_CACHE_SIZE {
+            m.clear();
+        }
+        m.insert(sql.to_string(), p.clone());
+        Ok(p)
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn check_params(p: &Parsed, params: &[Value]) -> Result<()> {
+    if p.params != params.len() {
+        return Err(Error::Sql(format!(
+            "statement has {} parameters but {} were given",
+            p.params,
+            params.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Run statements in a read-only transaction.
-pub(crate) fn query<K: Kv>(kv: &mut K, sql: &str, params: &[Value]) -> Result<QueryResult> {
-    let stmts = prepare(sql, params)?;
+pub(crate) fn query<K: Kv>(kv: &mut K, p: &Parsed, params: &[Value]) -> Result<QueryResult> {
+    check_params(p, params)?;
     let mut last = QueryResult::default();
-    for s in &stmts {
+    for s in &p.stmts {
         match s {
             parser::Stmt::Select(sel) => last = exec::select(kv, sel, params)?,
             _ => return Err(Error::Sql("a read transaction can only run SELECT".into())),
@@ -87,30 +151,17 @@ pub(crate) fn query<K: Kv>(kv: &mut K, sql: &str, params: &[Value]) -> Result<Qu
     Ok(last)
 }
 
-pub(crate) fn is_read_only(sql: &str) -> Result<bool> {
-    let (stmts, _) = parser::parse(sql)?;
-    Ok(stmts.iter().all(|s| matches!(s, parser::Stmt::Select(_))))
-}
-
-fn prepare(sql: &str, params: &[Value]) -> Result<Vec<parser::Stmt>> {
-    let (stmts, n) = parser::parse(sql)?;
-    if n != params.len() {
-        return Err(Error::Sql(format!(
-            "statement has {n} parameters but {} were given",
-            params.len()
-        )));
-    }
-    Ok(stmts)
-}
-
 /// Run each statement in turn. A failing statement is undone on its own.
-pub(crate) fn execute<K: KvWrite>(kv: &mut K, sql: &str, params: &[Value]) -> Result<QueryResult> {
-    let stmts = prepare(sql, params)?;
+pub(crate) fn execute<K: KvWrite>(kv: &mut K, p: &Parsed, params: &[Value]) -> Result<QueryResult> {
+    check_params(p, params)?;
     let mut last = QueryResult::default();
-    for s in &stmts {
+    for s in &p.stmts {
         kv.mark();
         match exec::statement(kv, s, params) {
-            Ok(r) => last = r,
+            Ok(r) => {
+                kv.release();
+                last = r
+            }
             Err(e) => {
                 kv.rollback();
                 return Err(e);

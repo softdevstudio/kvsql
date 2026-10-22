@@ -14,13 +14,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{corrupt, Error, Result};
+use crate::idhash::{IdMap, IdSet};
 use crate::page::{
     self, get_u32, get_u64, new_page, put_u32, put_u64, PageType, HEADER, PAGE_SIZE,
 };
-use crate::sql::{self, QueryResult, SchemaCache, Value as SqlValue};
+use crate::sql::{self, QueryResult, SchemaCache, SchemaMap, Value as SqlValue};
 use crate::storage::{FileStorage, Storage};
 use crate::tree::{self, Page, PageRead, PageWrite, TreeStats, Val, MAX_KEY_LEN, MAX_VALUE_LEN};
 
@@ -98,42 +99,96 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Page cache, split into shards so readers on different threads rarely
-/// wait on each other.
+/// wait on each other. Each shard evicts with the clock algorithm: a page
+/// read since the hand last passed gets a second chance, so the root and
+/// branch pages that every lookup touches stay in memory.
 struct Cache {
-    shards: Vec<Mutex<HashMap<u64, Page>>>,
+    shards: Vec<Mutex<Shard>>,
     cap_per_shard: usize,
+}
+
+#[derive(Default)]
+struct Shard {
+    index: IdMap<usize>,
+    slots: Vec<Slot>,
+    hand: usize,
+}
+
+struct Slot {
+    id: u64,
+    page: Page,
+    used: bool,
 }
 
 impl Cache {
     fn new(cap: usize) -> Cache {
         Cache {
             shards: (0..CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(Shard::default()))
                 .collect(),
             cap_per_shard: cap.div_ceil(CACHE_SHARDS),
         }
     }
-    fn shard(&self, id: u64) -> &Mutex<HashMap<u64, Page>> {
+    fn shard(&self, id: u64) -> &Mutex<Shard> {
         &self.shards[(id as usize) % CACHE_SHARDS]
     }
     fn get(&self, id: u64) -> Option<Page> {
-        lock(self.shard(id)).get(&id).cloned()
+        let mut s = lock(self.shard(id));
+        let i = *s.index.get(&id)?;
+        let slot = &mut s.slots[i];
+        slot.used = true;
+        Some(slot.page.clone())
     }
-    fn insert(&self, id: u64, p: Page) {
+    fn insert(&self, id: u64, page: Page) {
         if self.cap_per_shard == 0 {
             return;
         }
-        let mut m = lock(self.shard(id));
-        if m.len() >= self.cap_per_shard && !m.contains_key(&id) {
-            let drop: Vec<u64> = m.keys().take(self.cap_per_shard / 4 + 1).copied().collect();
-            for k in drop {
-                m.remove(&k);
-            }
+        let mut s = lock(self.shard(id));
+        if let Some(&i) = s.index.get(&id) {
+            s.slots[i].page = page;
+            return;
         }
-        m.insert(id, p);
+        if s.slots.len() < self.cap_per_shard {
+            let i = s.slots.len();
+            s.slots.push(Slot {
+                id,
+                page,
+                used: false,
+            });
+            s.index.insert(id, i);
+            return;
+        }
+        loop {
+            let h = s.hand;
+            s.hand = (h + 1) % s.slots.len();
+            if s.slots[h].used {
+                s.slots[h].used = false;
+                continue;
+            }
+            let old = s.slots[h].id;
+            s.index.remove(&old);
+            s.slots[h] = Slot {
+                id,
+                page,
+                used: false,
+            };
+            s.index.insert(id, h);
+            return;
+        }
     }
     fn remove(&self, id: u64) {
-        lock(self.shard(id)).remove(&id);
+        let mut s = lock(self.shard(id));
+        let Some(i) = s.index.remove(&id) else {
+            return;
+        };
+        s.slots.swap_remove(i);
+        if i < s.slots.len() {
+            let moved = s.slots[i].id;
+            s.index.insert(moved, i);
+        }
+        if s.hand >= s.slots.len() {
+            s.hand = 0;
+        }
     }
 }
 
@@ -153,6 +208,9 @@ struct State {
     /// Open read snapshots: commit id -> how many readers hold it.
     readers: BTreeMap<u64, usize>,
     poisoned: bool,
+    /// Bumped by every commit that changes table definitions or the set of
+    /// keyspaces.
+    schema_generation: u64,
 }
 
 struct Shared {
@@ -161,6 +219,48 @@ struct Shared {
     state: Mutex<State>,
     /// Held for the life of a write transaction.
     writer: Mutex<()>,
+    /// Table definitions shared by transactions, valid for one schema
+    /// generation.
+    schemas: Mutex<SharedSchemas>,
+    /// Parsed SQL by text.
+    stmts: sql::StmtCache,
+}
+
+#[derive(Default)]
+struct SharedSchemas {
+    generation: u64,
+    map: Arc<SchemaMap>,
+}
+
+impl Shared {
+    /// The shared definitions, if they belong to `generation`.
+    fn schema_base(&self, generation: u64) -> Option<Arc<SchemaMap>> {
+        let s = lock(&self.schemas);
+        (s.generation == generation).then(|| s.map.clone())
+    }
+
+    /// Fold definitions a transaction looked up back into the shared map.
+    fn learn_schemas(&self, generation: u64, cache: &mut SchemaCache) {
+        let Some((base, learned)) = cache.learned() else {
+            return;
+        };
+        let mut s = lock(&self.schemas);
+        if s.generation > generation {
+            return;
+        }
+        let mut map = if s.generation == generation {
+            match base {
+                // Nothing else was added since this transaction started.
+                Some(b) if Arc::ptr_eq(&b, &s.map) => b,
+                _ => s.map.clone(),
+            }
+        } else {
+            Arc::new(SchemaMap::new())
+        };
+        Arc::make_mut(&mut map).extend(learned);
+        s.generation = generation;
+        s.map = map;
+    }
 }
 
 impl Shared {
@@ -305,8 +405,11 @@ impl Db {
                 free: Vec::new(),
                 readers: BTreeMap::new(),
                 poisoned: false,
+                schema_generation: 0,
             }),
             writer: Mutex::new(()),
+            schemas: Mutex::new(SharedSchemas::default()),
+            stmts: sql::StmtCache::default(),
         };
         // Load the free list. Nobody holds a snapshot yet, so every listed
         // page is free to reuse at once.
@@ -358,11 +461,15 @@ impl Db {
             return Err(Error::Poisoned);
         }
         let meta = st.meta;
+        let schema_generation = st.schema_generation;
         *st.readers.entry(meta.txid).or_insert(0) += 1;
+        drop(st);
         Ok(ReadTx {
             shared: &self.shared,
             meta,
-            schemas: SchemaCache::default(),
+            schema_generation,
+            // Filled on first use, so plain key reads skip the shared lock.
+            schemas: None,
         })
     }
 
@@ -406,11 +513,12 @@ impl Db {
     /// snapshot; anything else runs in one write transaction that commits
     /// only if every statement succeeds. `?` placeholders take `params`.
     pub fn execute(&self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
-        if sql::is_read_only(sql_text)? {
-            return self.begin_read()?.query(sql_text, params);
+        let parsed = self.shared.stmts.parse(sql_text)?;
+        if parsed.read_only() {
+            return sql::query(&mut self.begin_read()?, &parsed, params);
         }
         let mut tx = self.begin_write()?;
-        let r = tx.execute(sql_text, params)?;
+        let r = sql::execute(&mut tx, &parsed, params)?;
         tx.commit()?;
         Ok(r)
     }
@@ -442,14 +550,16 @@ impl Db {
         reusable.sort_unstable_by(|a, b| b.cmp(a));
         let base = st.meta;
         let old_free_pages = st.free_pages.clone();
+        let schema_generation = st.schema_generation;
         drop(st);
+        let schemas = SchemaCache::with_base(self.shared.schema_base(schema_generation));
         Ok(WriteTx {
             shared: &self.shared,
             _guard: guard,
             base,
             old_free_pages,
-            dirty: HashMap::new(),
-            fresh: HashSet::new(),
+            dirty: IdMap::default(),
+            fresh: IdSet::default(),
             reusable,
             held,
             pending: Vec::new(),
@@ -457,7 +567,8 @@ impl Db {
             dir_root: base.dir_root,
             roots: HashMap::new(),
             changed: Vec::new(),
-            schemas: SchemaCache::default(),
+            schema_generation,
+            schemas,
             savepoint: None,
         })
     }
@@ -476,7 +587,8 @@ impl Db {
         let mut r = ReadTx {
             shared: &self.shared,
             meta,
-            schemas: SchemaCache::default(),
+            schema_generation: u64::MAX,
+            schemas: Some(SchemaCache::default()),
         };
         *lock(&self.shared.state)
             .readers
@@ -541,7 +653,8 @@ impl Db {
 pub struct ReadTx<'a> {
     shared: &'a Shared,
     meta: Meta,
-    schemas: SchemaCache,
+    schema_generation: u64,
+    schemas: Option<SchemaCache>,
 }
 
 impl PageRead for ReadTx<'_> {
@@ -552,6 +665,9 @@ impl PageRead for ReadTx<'_> {
 
 impl Drop for ReadTx<'_> {
     fn drop(&mut self) {
+        if let (Some(cache), true) = (&mut self.schemas, self.schema_generation != u64::MAX) {
+            self.shared.learn_schemas(self.schema_generation, cache);
+        }
         let mut st = lock(&self.shared.state);
         if let Some(n) = st.readers.get_mut(&self.meta.txid) {
             *n -= 1;
@@ -587,14 +703,17 @@ impl sql::Kv for ReadTx<'_> {
         }
     }
     fn schemas(&mut self) -> &mut SchemaCache {
-        &mut self.schemas
+        let (shared, generation) = (self.shared, self.schema_generation);
+        self.schemas
+            .get_or_insert_with(|| SchemaCache::with_base(shared.schema_base(generation)))
     }
 }
 
 impl ReadTx<'_> {
     /// Run SELECT statements on this snapshot.
     pub fn query(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
-        sql::query(self, sql_text, params)
+        let parsed = self.shared.stmts.parse(sql_text)?;
+        sql::query(self, &parsed, params)
     }
 
     /// KV door for tables: see [`Db::get_row`].
@@ -643,10 +762,10 @@ pub struct WriteTx<'a> {
     base: Meta,
     old_free_pages: Vec<u64>,
     /// New page bodies, not yet sealed or in the file.
-    dirty: HashMap<u64, Page>,
+    dirty: IdMap<Page>,
     /// Pages allocated by this transaction. No committed state reaches them,
     /// so they can be freed and reused at once.
-    fresh: HashSet<u64>,
+    fresh: IdSet,
     /// Free pages safe to overwrite now.
     reusable: Vec<u64>,
     /// Free pages an open reader may still reach.
@@ -659,22 +778,33 @@ pub struct WriteTx<'a> {
     /// Keyspace roots seen or changed here; `None` means dropped or absent.
     roots: HashMap<Vec<u8>, Option<u64>>,
     changed: Vec<Vec<u8>>,
+    schema_generation: u64,
     schemas: SchemaCache,
     /// State at the start of the current SQL statement.
     savepoint: Option<Box<Savepoint>>,
 }
 
-/// Everything a statement can change before commit.
+/// How to undo a statement: the small parts of the transaction state as
+/// they were at its start, and a log of page-level changes since then.
+/// Undoing replays the log backwards, so the cost follows the size of the
+/// statement and not the size of the transaction.
 struct Savepoint {
-    dirty: HashMap<u64, Page>,
-    fresh: HashSet<u64>,
-    reusable: Vec<u64>,
-    held: Vec<Free>,
-    pending: Vec<u64>,
     page_count: u64,
     dir_root: u64,
     roots: HashMap<Vec<u8>, Option<u64>>,
     changed: Vec<Vec<u8>>,
+    log: Vec<Undo>,
+}
+
+enum Undo {
+    /// A page was allocated, from the reusable list or by growing the file.
+    Alloc { id: u64, reused: bool },
+    /// A page from this transaction was freed and went back on the reusable list.
+    FreeFresh { id: u64, page: Option<Page> },
+    /// A committed page was freed and went on the pending list.
+    FreeCommitted,
+    /// A page body was written; this was the body before.
+    Write { id: u64, prev: Option<Page> },
 }
 
 impl PageRead for WriteTx<'_> {
@@ -688,23 +818,32 @@ impl PageRead for WriteTx<'_> {
 
 impl PageWrite for WriteTx<'_> {
     fn alloc(&mut self) -> u64 {
-        let id = match self.reusable.pop() {
-            Some(id) => id,
+        let (id, reused) = match self.reusable.pop() {
+            Some(id) => (id, true),
             None => {
                 self.page_count += 1;
-                self.page_count - 1
+                (self.page_count - 1, false)
             }
         };
         self.fresh.insert(id);
+        if let Some(sp) = &mut self.savepoint {
+            sp.log.push(Undo::Alloc { id, reused });
+        }
         id
     }
 
     fn free(&mut self, id: u64) {
         if self.fresh.remove(&id) {
-            self.dirty.remove(&id);
+            let page = self.dirty.remove(&id);
             self.reusable.push(id);
+            if let Some(sp) = &mut self.savepoint {
+                sp.log.push(Undo::FreeFresh { id, page });
+            }
         } else {
             self.pending.push(id);
+            if let Some(sp) = &mut self.savepoint {
+                sp.log.push(Undo::FreeCommitted);
+            }
         }
     }
 
@@ -714,7 +853,10 @@ impl PageWrite for WriteTx<'_> {
             "write to page {id} not allocated here"
         );
         // Sealed once at commit; a page can be rewritten many times before then.
-        self.dirty.insert(id, page.into());
+        let prev = self.dirty.insert(id, page.into());
+        if let Some(sp) = &mut self.savepoint {
+            sp.log.push(Undo::Write { id, prev });
+        }
     }
 }
 
@@ -768,6 +910,9 @@ impl sql::KvWrite for WriteTx<'_> {
     fn rollback(&mut self) {
         WriteTx::rollback(self)
     }
+    fn release(&mut self) {
+        WriteTx::release(self)
+    }
 }
 
 impl WriteTx<'_> {
@@ -782,7 +927,11 @@ impl WriteTx<'_> {
     }
 
     fn set_root(&mut self, name: &[u8], root: Option<u64>) {
-        self.roots.insert(name.to_vec(), root);
+        let old = self.roots.insert(name.to_vec(), root);
+        if old.map(|o| o.is_some()) != Some(root.is_some()) {
+            // A keyspace appeared or went away: plain-keyspace tables change.
+            self.schemas.clear();
+        }
         if !self.changed.iter().any(|n| n == name) {
             self.changed.push(name.to_vec());
         }
@@ -911,7 +1060,8 @@ impl WriteTx<'_> {
     /// undone on its own; earlier statements stay, and the transaction can
     /// go on. `?` placeholders take `params`.
     pub fn execute(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
-        sql::execute(self, sql_text, params)
+        let parsed = self.shared.stmts.parse(sql_text)?;
+        sql::execute(self, &parsed, params)
     }
 
     /// KV door for tables: see [`Db::get_row`].
@@ -927,6 +1077,8 @@ impl WriteTx<'_> {
         let r = sql::put_row(self, table, row.to_vec());
         if r.is_err() {
             self.rollback();
+        } else {
+            self.release();
         }
         r
     }
@@ -938,32 +1090,60 @@ impl WriteTx<'_> {
         let r = sql::delete_row(self, table, pk);
         if r.is_err() {
             self.rollback();
+        } else {
+            self.release();
         }
         r
     }
 
     fn mark(&mut self) {
         self.savepoint = Some(Box::new(Savepoint {
-            dirty: self.dirty.clone(),
-            fresh: self.fresh.clone(),
-            reusable: self.reusable.clone(),
-            held: self.held.clone(),
-            pending: self.pending.clone(),
             page_count: self.page_count,
             dir_root: self.dir_root,
             roots: self.roots.clone(),
             changed: self.changed.clone(),
+            log: Vec::new(),
         }));
+    }
+
+    /// The statement since the last `mark` succeeded; stop logging.
+    fn release(&mut self) {
+        self.savepoint = None;
     }
 
     fn rollback(&mut self) {
         if let Some(sp) = self.savepoint.take() {
             let sp = *sp;
-            self.dirty = sp.dirty;
-            self.fresh = sp.fresh;
-            self.reusable = sp.reusable;
-            self.held = sp.held;
-            self.pending = sp.pending;
+            for u in sp.log.into_iter().rev() {
+                match u {
+                    Undo::Alloc { id, reused } => {
+                        self.fresh.remove(&id);
+                        self.dirty.remove(&id);
+                        if reused {
+                            self.reusable.push(id);
+                        }
+                    }
+                    Undo::FreeFresh { id, page } => {
+                        let back = self.reusable.pop();
+                        debug_assert_eq!(back, Some(id));
+                        self.fresh.insert(id);
+                        if let Some(p) = page {
+                            self.dirty.insert(id, p);
+                        }
+                    }
+                    Undo::FreeCommitted => {
+                        self.pending.pop();
+                    }
+                    Undo::Write { id, prev } => match prev {
+                        Some(p) => {
+                            self.dirty.insert(id, p);
+                        }
+                        None => {
+                            self.dirty.remove(&id);
+                        }
+                    },
+                }
+            }
             self.page_count = sp.page_count;
             self.dir_root = sp.dir_root;
             self.roots = sp.roots;
@@ -976,6 +1156,18 @@ impl WriteTx<'_> {
     pub fn commit(mut self) -> Result<()> {
         if self.changed.is_empty() && self.dirty.is_empty() && self.pending.is_empty() {
             return Ok(());
+        }
+        // Table definitions and plain-keyspace tables depend on the catalog
+        // and on which keyspaces exist. Did this commit change either?
+        let mut schema_changed = false;
+        let base_dir = self.base.dir_root;
+        for name in self.changed.clone() {
+            let before = base_dir != 0 && lookup_root(&mut self, base_dir, &name)?.is_some();
+            let after = self.roots[&name].is_some();
+            if before != after || name.as_slice() == sql::CATALOG.as_bytes() {
+                schema_changed = true;
+                break;
+            }
         }
         // Publish keyspace roots in the directory tree.
         for name in std::mem::take(&mut self.changed) {
@@ -1062,11 +1254,30 @@ impl WriteTx<'_> {
         writes.sort_unstable_by_key(|(id, _)| *id);
         let store = &self.shared.store;
         let result = (|| -> Result<()> {
-            for (id, p) in &writes {
-                store.write_at(id * PAGE_SIZE as u64, p)?;
+            // Pages with consecutive ids go out in one write.
+            let mut all: Vec<(u64, &[u8])> = writes
+                .iter()
+                .map(|(id, p)| (*id, &p[..]))
+                .chain(list_bodies.iter().map(|(id, p)| (*id, &p[..])))
+                .collect();
+            all.sort_unstable_by_key(|(id, _)| *id);
+            let mut run: Vec<u8> = Vec::new();
+            let mut run_start = 0u64;
+            let mut run_pages = 0u64;
+            for (id, p) in all {
+                if run_pages > 0 && (id != run_start + run_pages || run_pages >= 256) {
+                    store.write_at(run_start * PAGE_SIZE as u64, &run)?;
+                    run.clear();
+                    run_pages = 0;
+                }
+                if run_pages == 0 {
+                    run_start = id;
+                }
+                run.extend_from_slice(p);
+                run_pages += 1;
             }
-            for (id, p) in &list_bodies {
-                store.write_at(id * PAGE_SIZE as u64, p)?;
+            if run_pages > 0 {
+                store.write_at(run_start * PAGE_SIZE as u64, &run)?;
             }
             store.sync()?;
             let slot = meta.txid % 2;
@@ -1093,6 +1304,14 @@ impl WriteTx<'_> {
         st.meta = meta;
         st.free_pages = list_pages;
         st.free = free;
+        if schema_changed {
+            st.schema_generation += 1;
+        }
+        drop(st);
+        if !schema_changed {
+            self.shared
+                .learn_schemas(self.schema_generation, &mut self.schemas);
+        }
         Ok(())
     }
 }
