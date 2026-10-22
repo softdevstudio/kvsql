@@ -5,12 +5,12 @@
 //! commits before the response is sent. A 2xx answer to a write therefore
 //! means the write is on disk.
 
-use std::io::{BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kvsql_engine::sql::{QueryResult, Value};
 use kvsql_engine::{Db, Error};
@@ -26,8 +26,11 @@ pub struct Config {
     pub max_connections: usize,
     /// Largest request body accepted.
     pub max_body: usize,
-    /// Idle time before a keep-alive connection is closed.
+    /// Idle time before a keep-alive connection is closed, and the longest
+    /// wait for a reply to be taken by a slow client.
     pub idle_timeout: Duration,
+    /// Time allowed from the first byte of a request to its last.
+    pub request_timeout: Duration,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             max_connections: 256,
             max_body: 64 << 20,
             idle_timeout: Duration::from_secs(60),
+            request_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -53,11 +57,15 @@ pub fn serve(listener: TcpListener, db: Arc<Db>, cfg: Config) {
             let _ = write_response(&mut w, &error(503, "busy", "too many connections"), false);
             continue;
         }
-        let (db, cfg, active) = (db.clone(), cfg.clone(), active.clone());
-        thread::spawn(move || {
+        let (db, cfg, slot) = (db.clone(), cfg.clone(), active.clone());
+        // A roomy stack: SQL evaluation recurses over expression trees.
+        let started = thread::Builder::new().stack_size(8 << 20).spawn(move || {
             connection(stream, &db, &cfg);
-            active.fetch_sub(1, Ordering::SeqCst);
+            slot.fetch_sub(1, Ordering::SeqCst);
         });
+        if started.is_err() {
+            active.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -66,17 +74,58 @@ pub fn spawn(listener: TcpListener, db: Arc<Db>, cfg: Config) -> JoinHandle<()> 
     thread::spawn(move || serve(listener, db, cfg))
 }
 
+/// The read side of a connection. Waiting for a request to start may take
+/// up to the idle timeout; once its first byte arrives, the whole request
+/// must arrive within the request timeout, so a client cannot hold a
+/// connection slot by trickling bytes.
+struct Timed {
+    stream: TcpStream,
+    idle: Duration,
+    request: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let wait = match self.deadline {
+            None => self.idle,
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "request too slow"));
+                }
+                left
+            }
+        };
+        self.stream
+            .set_read_timeout(Some(wait.max(Duration::from_millis(1))))?;
+        let n = self.stream.read(buf)?;
+        if n > 0 && self.deadline.is_none() {
+            self.deadline = Some(Instant::now() + self.request);
+        }
+        Ok(n)
+    }
+}
+
 fn connection(stream: TcpStream, db: &Db, cfg: &Config) {
-    let _ = stream.set_read_timeout(Some(cfg.idle_timeout));
     let _ = stream.set_nodelay(true);
+    let _ = stream.set_write_timeout(Some(cfg.idle_timeout));
     let Ok(write_half) = stream.try_clone() else {
         return;
     };
-    let mut r = BufReader::new(stream);
+    let mut r = BufReader::new(Timed {
+        stream,
+        idle: cfg.idle_timeout,
+        request: cfg.request_timeout,
+        deadline: None,
+    });
     let mut w = BufWriter::new(write_half);
     loop {
         let req = match read_request(&mut r, cfg.max_body) {
-            Ok(req) => req,
+            Ok(req) => {
+                r.get_mut().deadline = None;
+                req
+            }
             Err(ReadError::Bad(status, msg)) => {
                 let _ = write_response(&mut w, &error(status, "request", &msg), false);
                 return;

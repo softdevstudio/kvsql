@@ -36,7 +36,7 @@ Writes from many connections are serialised, one at a time, through the engine's
 
 ### HTTP
 
-HTTP/1.1 with keep-alive. Bodies must use `Content-Length`; chunked bodies get 411. The largest body is 64 MiB. Idle connections close after 60 seconds. Path segments are percent-encoded, so keys can hold any bytes.
+HTTP/1.1 with keep-alive. Bodies must use `Content-Length`; chunked bodies get 411. The largest body is 64 MiB. A connection waiting for its next request closes after 60 seconds. Once a request starts, all of it must arrive within 30 seconds, or the connection is closed; a reply the client does not take within 60 seconds is dropped the same way. Path segments are percent-encoded, so keys can hold any bytes.
 
 ### Values in JSON
 
@@ -61,7 +61,7 @@ Keys and values in KV listings use a string when the bytes are valid UTF-8 and t
 | `GET /kv/{ks}/{key}` | The raw value bytes, `application/octet-stream`. 404 if missing. |
 | `PUT /kv/{ks}/{key}` | Body is the raw value. Creates the keyspace if needed. `{"ok":true}` |
 | `DELETE /kv/{ks}/{key}` | `{"deleted":true}` or `{"deleted":false}` |
-| `GET /rows/{table}/{pk}` | A table row by primary key, with no SQL parsing. `{"row":[...]}`. The key in the path is text and is converted to the key column's type. |
+| `GET /rows/{table}/{pk}` | A table row by primary key, with no SQL parsing. `{"row":[...]}`. The key in the path is text and is converted to the key column's type, so this works for INTEGER and TEXT keys; read a row with a BLOB key through `POST /sql` with a `$blob` parameter. |
 | `PUT /rows/{table}` | Insert or replace a whole row. Body is a JSON array of column values, or `{"row":[...]}`. Indexes are kept. |
 | `DELETE /rows/{table}/{pk}` | `{"deleted":true}` or `{"deleted":false}` |
 | `POST /sql` | Body `{"sql":"...","params":[...]}`, or plain SQL text. Answers `{"columns":[...],"rows":[[...]],"changes":N}`; for several statements, the result of the last. |

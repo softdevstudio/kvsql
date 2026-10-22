@@ -339,6 +339,7 @@ pub fn parse(src: &str) -> Result<(Vec<Stmt>, usize)> {
         toks: tokenize(src)?,
         pos: 0,
         params: 0,
+        depth: 0,
     };
     let mut out = Vec::new();
     loop {
@@ -361,6 +362,83 @@ struct Parser {
     toks: Vec<Tok>,
     pos: usize,
     params: usize,
+    /// Nesting of expressions being parsed right now.
+    depth: usize,
+}
+
+/// Deepest expression accepted. Binding and evaluation recurse over the
+/// tree, so an unbounded depth would let one statement overflow the stack.
+/// Long lists of alternatives are better written with IN, which is flat.
+pub const MAX_EXPR_DEPTH: usize = 250;
+
+/// Deepest nesting of parentheses, function calls, CASE and unary operators.
+/// The parser recurses about ten calls per level, so this is lower.
+pub const MAX_NESTING: usize = 64;
+
+fn too_deep() -> Error {
+    Error::Sql(format!(
+        "expression nested more than {MAX_EXPR_DEPTH} levels deep"
+    ))
+}
+
+fn too_nested() -> Error {
+    Error::Sql(format!(
+        "expression nested more than {MAX_NESTING} levels deep in parentheses, calls or signs"
+    ))
+}
+
+/// Join a run of AND or OR terms into a balanced tree. Both are associative
+/// under SQL's three-valued logic, so the answer is the same as a chain,
+/// and a list of thousands of terms stays a few dozen levels deep.
+fn balanced(op: BinOp, mut terms: Vec<Expr>) -> Expr {
+    if terms.len() == 1 {
+        return terms.pop().unwrap();
+    }
+    let right = terms.split_off(terms.len() / 2);
+    Expr::Bin(
+        op,
+        Box::new(balanced(op, terms)),
+        Box::new(balanced(op, right)),
+    )
+}
+
+/// Count one more link in an operator chain; chains build deep trees.
+fn chain_check(chain: &mut usize) -> Result<()> {
+    *chain += 1;
+    if *chain > MAX_EXPR_DEPTH {
+        return Err(too_deep());
+    }
+    Ok(())
+}
+
+/// Depth of an expression tree, giving up once it passes `limit`.
+fn depth_over(e: &Expr, limit: usize) -> bool {
+    if limit == 0 {
+        return true;
+    }
+    let l = limit - 1;
+    match e {
+        Expr::Lit(_) | Expr::Param(_) | Expr::Column { .. } => false,
+        Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => depth_over(a, l),
+        Expr::Bin(_, a, b) => depth_over(a, l) || depth_over(b, l),
+        Expr::In { expr, list, .. } => depth_over(expr, l) || list.iter().any(|x| depth_over(x, l)),
+        Expr::Between { expr, lo, hi, .. } => {
+            depth_over(expr, l) || depth_over(lo, l) || depth_over(hi, l)
+        }
+        Expr::Like { expr, pattern, .. } => depth_over(expr, l) || depth_over(pattern, l),
+        Expr::Func { args, .. } => args.iter().any(|x| depth_over(x, l)),
+        Expr::Case {
+            operand,
+            whens,
+            otherwise,
+        } => {
+            operand.as_ref().is_some_and(|x| depth_over(x, l))
+                || whens
+                    .iter()
+                    .any(|(a, b)| depth_over(a, l) || depth_over(b, l))
+                || otherwise.as_ref().is_some_and(|x| depth_over(x, l))
+        }
+    }
 }
 
 const RESERVED: &[&str] = &[
@@ -818,56 +896,80 @@ impl Parser {
     // Expressions, lowest precedence first.
 
     pub fn expr(&mut self) -> Result<Expr> {
-        self.or()
+        self.enter()?;
+        let e = self.or();
+        self.depth -= 1;
+        let e = e?;
+        // Operator chains are parsed in loops but still build deep trees.
+        if self.depth == 0 && depth_over(&e, MAX_EXPR_DEPTH) {
+            return Err(too_deep());
+        }
+        Ok(e)
+    }
+
+    fn enter(&mut self) -> Result<()> {
+        if self.depth >= MAX_NESTING {
+            return Err(too_nested());
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn or(&mut self) -> Result<Expr> {
-        let mut l = self.and()?;
+        let mut terms = vec![self.and()?];
         while self.eat_kw("or") {
-            let r = self.and()?;
-            l = Expr::Bin(BinOp::Or, Box::new(l), Box::new(r));
+            terms.push(self.and()?);
         }
-        Ok(l)
+        Ok(balanced(BinOp::Or, terms))
     }
 
     fn and(&mut self) -> Result<Expr> {
-        let mut l = self.not()?;
+        let mut terms = vec![self.not()?];
         while self.eat_kw("and") {
-            let r = self.not()?;
-            l = Expr::Bin(BinOp::And, Box::new(l), Box::new(r));
+            terms.push(self.not()?);
         }
-        Ok(l)
+        Ok(balanced(BinOp::And, terms))
     }
 
     fn not(&mut self) -> Result<Expr> {
         if self.eat_kw("not") {
-            return Ok(Expr::Not(Box::new(self.not()?)));
+            self.enter()?;
+            let e = self.not();
+            self.depth -= 1;
+            return Ok(Expr::Not(Box::new(e?)));
         }
         self.equality()
     }
 
     fn equality(&mut self) -> Result<Expr> {
+        let mut chain = 0usize;
         let mut l = self.relational()?;
         loop {
             if self.eat_sym("=") || self.eat_sym("==") {
                 let r = self.relational()?;
                 l = Expr::Bin(BinOp::Eq, Box::new(l), Box::new(r));
+                chain_check(&mut chain)?;
             } else if self.eat_sym("!=") || self.eat_sym("<>") {
                 let r = self.relational()?;
                 l = Expr::Bin(BinOp::Ne, Box::new(l), Box::new(r));
+                chain_check(&mut chain)?;
             } else if self.eat_kw("is") {
                 let negated = self.eat_kw("not");
                 if self.eat_kw("null") {
                     l = Expr::IsNull(Box::new(l), negated);
+                    chain_check(&mut chain)?;
                 } else {
                     let r = self.relational()?;
                     let op = if negated { BinOp::IsNot } else { BinOp::Is };
                     l = Expr::Bin(op, Box::new(l), Box::new(r));
+                    chain_check(&mut chain)?;
                 }
             } else if self.eat_kw("isnull") {
                 l = Expr::IsNull(Box::new(l), false);
+                chain_check(&mut chain)?;
             } else if self.eat_kw("notnull") {
                 l = Expr::IsNull(Box::new(l), true);
+                chain_check(&mut chain)?;
             } else {
                 let negated = if self.is_kw("not")
                     && matches!(self.peek_at(1), Tok::Word(w) if w == "in" || w == "like" || w == "between" || w == "null")
@@ -879,6 +981,7 @@ impl Parser {
                 };
                 if self.eat_kw("null") {
                     l = Expr::IsNull(Box::new(l), true);
+                    chain_check(&mut chain)?;
                 } else if self.eat_kw("in") {
                     self.expect_sym("(")?;
                     let mut list = Vec::new();
@@ -894,6 +997,7 @@ impl Parser {
                         list,
                         negated,
                     };
+                    chain_check(&mut chain)?;
                 } else if self.eat_kw("like") {
                     let pattern = self.relational()?;
                     l = Expr::Like {
@@ -901,6 +1005,7 @@ impl Parser {
                         pattern: Box::new(pattern),
                         negated,
                     };
+                    chain_check(&mut chain)?;
                 } else if self.eat_kw("between") {
                     let lo = self.relational()?;
                     self.expect_kw("and")?;
@@ -911,6 +1016,7 @@ impl Parser {
                         hi: Box::new(hi),
                         negated,
                     };
+                    chain_check(&mut chain)?;
                 } else if negated {
                     return err("expected IN, LIKE or BETWEEN after NOT");
                 } else {
@@ -922,6 +1028,7 @@ impl Parser {
     }
 
     fn relational(&mut self) -> Result<Expr> {
+        let mut chain = 0usize;
         let mut l = self.additive()?;
         loop {
             let op = if self.eat_sym("<=") {
@@ -937,11 +1044,13 @@ impl Parser {
             };
             let r = self.additive()?;
             l = Expr::Bin(op, Box::new(l), Box::new(r));
+            chain_check(&mut chain)?;
         }
         Ok(l)
     }
 
     fn additive(&mut self) -> Result<Expr> {
+        let mut chain = 0usize;
         let mut l = self.multiplicative()?;
         loop {
             let op = if self.eat_sym("+") {
@@ -953,11 +1062,13 @@ impl Parser {
             };
             let r = self.multiplicative()?;
             l = Expr::Bin(op, Box::new(l), Box::new(r));
+            chain_check(&mut chain)?;
         }
         Ok(l)
     }
 
     fn multiplicative(&mut self) -> Result<Expr> {
+        let mut chain = 0usize;
         let mut l = self.concat()?;
         loop {
             let op = if self.eat_sym("*") {
@@ -971,22 +1082,28 @@ impl Parser {
             };
             let r = self.concat()?;
             l = Expr::Bin(op, Box::new(l), Box::new(r));
+            chain_check(&mut chain)?;
         }
         Ok(l)
     }
 
     fn concat(&mut self) -> Result<Expr> {
+        let mut chain = 0usize;
         let mut l = self.unary()?;
         while self.eat_sym("||") {
             let r = self.unary()?;
             l = Expr::Bin(BinOp::Concat, Box::new(l), Box::new(r));
+            chain_check(&mut chain)?;
         }
         Ok(l)
     }
 
     fn unary(&mut self) -> Result<Expr> {
         if self.eat_sym("-") {
-            return Ok(match self.unary()? {
+            self.enter()?;
+            let e = self.unary();
+            self.depth -= 1;
+            return Ok(match e? {
                 Expr::Lit(Value::Int(i)) => Expr::Lit(match i.checked_neg() {
                     Some(n) => Value::Int(n),
                     None => Value::Real(-(i as f64)),
@@ -996,7 +1113,10 @@ impl Parser {
             });
         }
         if self.eat_sym("+") {
-            return self.unary();
+            self.enter()?;
+            let e = self.unary();
+            self.depth -= 1;
+            return e;
         }
         self.primary()
     }

@@ -93,14 +93,16 @@ impl Parsed {
 }
 
 /// Parsed statements by SQL text, shared by every transaction on a handle.
-/// Parsing does not look at the schema, so entries never go stale. The
-/// cache is emptied when it fills up.
+/// Parsing does not look at the schema, so entries never go stale. Only
+/// short texts are kept, the usual shape of a statement run many times with
+/// parameters; the cache is emptied when it fills up.
 #[derive(Default)]
 pub(crate) struct StmtCache {
     map: Mutex<HashMap<String, Arc<Parsed>>>,
 }
 
 const STMT_CACHE_SIZE: usize = 256;
+const STMT_CACHE_MAX_TEXT: usize = 2048;
 
 impl StmtCache {
     pub(crate) fn parse(&self, sql: &str) -> Result<Arc<Parsed>> {
@@ -114,6 +116,9 @@ impl StmtCache {
             params,
             read_only,
         });
+        if sql.len() > STMT_CACHE_MAX_TEXT {
+            return Ok(p);
+        }
         let mut m = lock(&self.map);
         if m.len() >= STMT_CACHE_SIZE {
             m.clear();

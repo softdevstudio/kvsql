@@ -515,3 +515,82 @@ fn schema_cache_follows_keyspace_and_table_changes() {
     assert_eq!(rows(&db, "SELECT count(*) FROM p WHERE b = 5")[0][0], i(2));
     db.verify().unwrap();
 }
+
+/// Deeply nested SQL is refused with an error instead of overflowing the
+/// stack, in every shape: operator chains, parentheses, unary signs, NOT.
+#[test]
+fn deep_expressions_are_refused() {
+    let db = db();
+    let ok = format!("SELECT {}", vec!["1"; 200].join(" + "));
+    assert_eq!(rows(&db, &ok)[0][0], i(200));
+    let ok = format!("SELECT {}1{}", "(".repeat(60), ")".repeat(60));
+    assert_eq!(rows(&db, &ok)[0][0], i(1));
+    // Long AND and OR lists are fine: they are kept balanced.
+    let ok = format!(
+        "SELECT 7 WHERE {} OR 1 = 1",
+        vec!["1 = 2"; 100_000].join(" OR ")
+    );
+    assert_eq!(rows(&db, &ok), vec![vec![i(7)]]);
+    let ok = format!(
+        "SELECT 7 WHERE {} AND 1 = 2",
+        vec!["1 = 1"; 5_000].join(" AND ")
+    );
+    assert!(rows(&db, &ok).is_empty());
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT 1 AND NULL AND 0, 0 OR NULL OR 1, NULL OR 0 OR NULL"
+        ),
+        vec![vec![i(0), i(1), Value::Null]]
+    );
+    for sql in [
+        format!("SELECT {}", vec!["1"; 300_000].join(" + ")),
+        format!("SELECT {}1{}", "(".repeat(100_000), ")".repeat(100_000)),
+        format!("SELECT {}1", "- ".repeat(100_000)),
+        format!("SELECT {}1", "+ ".repeat(100_000)),
+        format!("SELECT {}1", "NOT ".repeat(100_000)),
+        format!(
+            "SELECT abs({}1{})",
+            "abs(".repeat(100_000),
+            ")".repeat(100_000)
+        ),
+        format!("SELECT {}", vec!["(1 * 1 * 1 * 1)"; 2_000].join(" + ")),
+        format!(
+            "SELECT {}",
+            (0..600).map(|_| "1 * 1").collect::<Vec<_>>().join(" + ")
+        ),
+    ] {
+        let e = db.execute(&sql, &[]).unwrap_err();
+        assert!(e.to_string().contains("nested more than"), "{e}");
+    }
+}
+
+/// A raw put into a table keyspace that fails part way, after the row was
+/// written but before its index entry, leaves nothing behind.
+#[test]
+fn failed_kv_door_put_keeps_indexes_exact() {
+    let db = db();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT); CREATE INDEX ia ON t(a)",
+        &[],
+    )
+    .unwrap();
+    let mut tx = db.begin_write().unwrap();
+    let long = "x".repeat(600);
+    let key = key_for(&i(1)).unwrap();
+    let r = tx.put("t", &key, &encode_row(&[i(1), t(&long)]));
+    assert!(r.is_err());
+    tx.put(
+        "t",
+        &key_for(&i(2)).unwrap(),
+        &encode_row(&[i(2), t("short")]),
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    db.verify().unwrap();
+    assert!(db.get_row("t", &i(1)).unwrap().is_none());
+    assert_eq!(
+        rows(&db, "SELECT id FROM t WHERE a = 'short'"),
+        vec![vec![i(2)]]
+    );
+}

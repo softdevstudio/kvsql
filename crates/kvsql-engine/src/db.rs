@@ -382,7 +382,8 @@ impl Db {
         let meta = match best {
             Some(m) => m,
             None if len <= 2 * PAGE_SIZE as u64 => {
-                // New file, or one whose first commit never finished.
+                // A new file, or one whose first meta page write was cut
+                // short. Anything else is not ours to overwrite.
                 let m = Meta {
                     txid: 0,
                     dir_root: 0,
@@ -390,11 +391,24 @@ impl Db {
                     free_head: 0,
                     free_count: 0,
                 };
-                store.write_at(0, &m.encode(0))?;
+                let first = m.encode(0);
+                let mut have = vec![0u8; len as usize];
+                store.read_at(0, &mut have)?;
+                let ours = have.chunks(512).enumerate().all(|(i, sector)| {
+                    let at = i * 512;
+                    sector.iter().all(|&b| b == 0)
+                        || (at < PAGE_SIZE && sector == &first[at..at + sector.len()])
+                });
+                if !ours {
+                    return corrupt("not a KvSQL database file");
+                }
+                store.write_at(0, &first)?;
                 store.sync()?;
                 m
             }
-            None => return corrupt("no valid meta page"),
+            None => {
+                return corrupt("no valid meta page; not a KvSQL database file, or a damaged one")
+            }
         };
         let shared = Shared {
             store,
@@ -438,6 +452,14 @@ impl Db {
         }
         if free.len() as u64 != meta.free_count {
             return corrupt("free list length does not match meta page");
+        }
+        // A damaged list must not hand out a meta page, a page past the end,
+        // or one page twice.
+        let mut seen: HashSet<u64> = free_pages.iter().copied().collect();
+        for f in &free {
+            if f.id < 2 || f.id >= meta.page_count || !seen.insert(f.id) {
+                return corrupt(format!("free list holds a bad page id {}", f.id));
+            }
         }
         {
             let mut st = lock(&shared.state);
@@ -790,9 +812,6 @@ pub struct WriteTx<'a> {
 /// statement and not the size of the transaction.
 struct Savepoint {
     page_count: u64,
-    dir_root: u64,
-    roots: HashMap<Vec<u8>, Option<u64>>,
-    changed: Vec<Vec<u8>>,
     log: Vec<Undo>,
 }
 
@@ -805,6 +824,13 @@ enum Undo {
     FreeCommitted,
     /// A page body was written; this was the body before.
     Write { id: u64, prev: Option<Page> },
+    /// A keyspace root changed; `prev` is what the root map held, and
+    /// `pushed` says whether the name joined the changed list then.
+    Root {
+        name: Vec<u8>,
+        prev: Option<Option<u64>>,
+        pushed: bool,
+    },
 }
 
 impl PageRead for WriteTx<'_> {
@@ -932,8 +958,16 @@ impl WriteTx<'_> {
             // A keyspace appeared or went away: plain-keyspace tables change.
             self.schemas.clear();
         }
-        if !self.changed.iter().any(|n| n == name) {
+        let pushed = !self.changed.iter().any(|n| n == name);
+        if pushed {
             self.changed.push(name.to_vec());
+        }
+        if let Some(sp) = &mut self.savepoint {
+            sp.log.push(Undo::Root {
+                name: name.to_vec(),
+                prev: old,
+                pushed,
+            });
         }
     }
 
@@ -965,10 +999,25 @@ impl WriteTx<'_> {
     pub fn put(&mut self, keyspace: &str, key: &[u8], value: &[u8]) -> Result<()> {
         check_name(keyspace)?;
         check_key(key)?;
-        if sql::raw_put_hook(self, keyspace, key, value)? {
-            return Ok(());
+        // A put to a table keyspace also writes index entries; if any part
+        // fails, none of it stays.
+        self.mark();
+        let r = match sql::raw_put_hook(self, keyspace, key, value) {
+            Ok(true) => Ok(()),
+            Ok(false) => self.raw_put(keyspace, key, value),
+            Err(e) => Err(e),
+        };
+        self.finish(r)
+    }
+
+    /// End the savepoint taken by a KV-door call: keep the work, or undo it.
+    fn finish<T>(&mut self, r: Result<T>) -> Result<T> {
+        if r.is_err() {
+            self.rollback();
+        } else {
+            self.release();
         }
-        self.raw_put(keyspace, key, value)
+        r
     }
 
     pub(crate) fn raw_put(&mut self, keyspace: &str, key: &[u8], value: &[u8]) -> Result<()> {
@@ -998,10 +1047,13 @@ impl WriteTx<'_> {
     /// Remove a key. Returns whether it existed. Deleting from a SQL table
     /// also removes the row's index entries.
     pub fn delete(&mut self, keyspace: &str, key: &[u8]) -> Result<bool> {
-        if let Some(found) = sql::raw_delete_hook(self, keyspace, key)? {
-            return Ok(found);
-        }
-        self.raw_delete(keyspace, key)
+        self.mark();
+        let r = match sql::raw_delete_hook(self, keyspace, key) {
+            Ok(Some(found)) => Ok(found),
+            Ok(None) => self.raw_delete(keyspace, key),
+            Err(e) => Err(e),
+        };
+        self.finish(r)
     }
 
     pub(crate) fn raw_delete(&mut self, keyspace: &str, key: &[u8]) -> Result<bool> {
@@ -1022,9 +1074,12 @@ impl WriteTx<'_> {
     /// Remove a keyspace and everything in it. Returns whether it existed.
     /// SQL tables are dropped with DROP TABLE instead.
     pub fn drop_keyspace(&mut self, keyspace: &str) -> Result<bool> {
-        sql::raw_drop_hook(self, keyspace)?;
-        self.schemas.clear();
-        self.raw_drop(keyspace)
+        self.mark();
+        let r = sql::raw_drop_hook(self, keyspace).and_then(|_| {
+            self.schemas.clear();
+            self.raw_drop(keyspace)
+        });
+        self.finish(r)
     }
 
     pub(crate) fn raw_drop(&mut self, keyspace: &str) -> Result<bool> {
@@ -1075,12 +1130,7 @@ impl WriteTx<'_> {
     pub fn put_row(&mut self, table: &str, row: &[SqlValue]) -> Result<()> {
         self.mark();
         let r = sql::put_row(self, table, row.to_vec());
-        if r.is_err() {
-            self.rollback();
-        } else {
-            self.release();
-        }
-        r
+        self.finish(r)
     }
 
     /// KV door for tables: delete a row by primary key. Returns whether it
@@ -1088,20 +1138,12 @@ impl WriteTx<'_> {
     pub fn delete_row(&mut self, table: &str, pk: &SqlValue) -> Result<bool> {
         self.mark();
         let r = sql::delete_row(self, table, pk);
-        if r.is_err() {
-            self.rollback();
-        } else {
-            self.release();
-        }
-        r
+        self.finish(r)
     }
 
     fn mark(&mut self) {
         self.savepoint = Some(Box::new(Savepoint {
             page_count: self.page_count,
-            dir_root: self.dir_root,
-            roots: self.roots.clone(),
-            changed: self.changed.clone(),
             log: Vec::new(),
         }));
     }
@@ -1142,12 +1184,22 @@ impl WriteTx<'_> {
                             self.dirty.remove(&id);
                         }
                     },
+                    Undo::Root { name, prev, pushed } => {
+                        if pushed {
+                            self.changed.pop();
+                        }
+                        match prev {
+                            Some(p) => {
+                                self.roots.insert(name, p);
+                            }
+                            None => {
+                                self.roots.remove(&name);
+                            }
+                        }
+                    }
                 }
             }
             self.page_count = sp.page_count;
-            self.dir_root = sp.dir_root;
-            self.roots = sp.roots;
-            self.changed = sp.changed;
         }
         self.schemas.clear();
     }

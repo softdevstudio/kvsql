@@ -7,7 +7,17 @@ There are two products:
 - **KvSQL Engine**, a Rust library you embed in your program. One file on disk, no server.
 - **KvSQL DB**, a database server and command-line shell built on the engine.
 
-Status: early development. The storage engine, key-value API, snapshot readers, SQL, the server and the shell work and are tested. Nothing is released yet.
+Status: first release, 0.1.0. The storage engine, key-value API, snapshot readers, SQL, the server and the shell work and are tested. The file format may still change before 1.0.
+
+## Download
+
+Each [release](https://github.com/softdevstudio/kvsql/releases/latest) has `kvsqld` and `kvsql` built for Linux (x86_64 and arm64), macOS (Apple silicon and Intel) and Windows (x86_64), with a `SHA256SUMS` file:
+
+- [kvsql-linux-x86_64.tar.gz](https://github.com/softdevstudio/kvsql/releases/latest/download/kvsql-linux-x86_64.tar.gz)
+- [kvsql-linux-arm64.tar.gz](https://github.com/softdevstudio/kvsql/releases/latest/download/kvsql-linux-arm64.tar.gz)
+- [kvsql-macos-arm64.tar.gz](https://github.com/softdevstudio/kvsql/releases/latest/download/kvsql-macos-arm64.tar.gz)
+- [kvsql-macos-x86_64.tar.gz](https://github.com/softdevstudio/kvsql/releases/latest/download/kvsql-macos-x86_64.tar.gz)
+- [kvsql-windows-x86_64.zip](https://github.com/softdevstudio/kvsql/releases/latest/download/kvsql-windows-x86_64.zip)
 
 ## Why one store for both
 
@@ -21,8 +31,10 @@ Add it as a Git dependency:
 
 ```toml
 [dependencies]
-kvsql-engine = { git = "https://github.com/softdevstudio/kvsql" }
+kvsql-engine = { git = "https://github.com/softdevstudio/kvsql", tag = "v0.1.0" }
 ```
+
+The engine has no dependencies of its own.
 
 ```rust
 use kvsql_engine::Db;
@@ -139,7 +151,7 @@ Run them all and record the output:
 bash scripts/record-results.sh
 ```
 
-The output goes to `test/results/latest/checks.log`.
+The output goes to `test/results/latest/checks.log`, and a benchmark against SQLite on the same machine goes to `test/results/latest/bench.md`. The benchmark lists its conditions at the top: both databases on real files with the same page cache, reads in shuffled key order, every commit synced to disk.
 
 ## License
 

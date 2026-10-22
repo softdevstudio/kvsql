@@ -238,3 +238,66 @@ fn malformed_requests_get_clear_errors() {
     let mut c = Client::new(&url, None).unwrap();
     assert_eq!(req(&mut c, "GET", "/health", "").0, 200);
 }
+
+#[test]
+fn slow_requests_lose_their_slot() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let url = start(Config {
+        max_connections: 1,
+        request_timeout: Duration::from_millis(400),
+        ..Config::default()
+    });
+    let addr = url.trim_start_matches("http://").to_string();
+    // A client that trickles a header one byte at a time.
+    let mut slow = std::net::TcpStream::connect(&addr).unwrap();
+    let t = Instant::now();
+    let mut closed = false;
+    for b in b"GET /health HTTP/1.1\r\nX-Slow: yes"
+        .iter()
+        .cycle()
+        .take(200)
+    {
+        if slow.write_all(&[*b]).is_err() {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let mut buf = [0u8; 64];
+        slow.set_nonblocking(true).unwrap();
+        let r = slow.read(&mut buf);
+        slow.set_nonblocking(false).unwrap();
+        if matches!(r, Ok(0)) || matches!(&r, Err(e) if e.kind() != std::io::ErrorKind::WouldBlock)
+        {
+            closed = true;
+            break;
+        }
+    }
+    assert!(closed, "slow client kept its connection");
+    assert!(t.elapsed() < Duration::from_secs(3));
+    // The slot is free again.
+    let mut ok = false;
+    for _ in 0..50 {
+        let mut c = Client::new(&url, None).unwrap();
+        if req(&mut c, "GET", "/health", "").0 == 200 {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ok);
+}
+
+#[test]
+fn hostile_sql_gets_an_error_not_a_crash() {
+    let url = start(Config::default());
+    let mut c = Client::new(&url, None).unwrap();
+    for body in [
+        format!("SELECT {}", vec!["1"; 50_000].join("+")),
+        format!("SELECT {}1{}", "(".repeat(50_000), ")".repeat(50_000)),
+    ] {
+        let (s, j) = req(&mut c, "POST", "/sql", &body);
+        assert_eq!(s, 400, "{j:?}");
+    }
+    assert_eq!(req(&mut c, "GET", "/health", "").0, 200);
+}

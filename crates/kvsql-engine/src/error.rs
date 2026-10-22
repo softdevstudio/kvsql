@@ -33,7 +33,11 @@ impl fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt file: {m}"),
             Error::Locked => write!(f, "file is locked by another writer"),
             Error::KeyTooLarge(n) => {
-                write!(f, "key length {n} is outside 1..={}", crate::MAX_KEY_LEN)
+                write!(
+                    f,
+                    "key is {n} bytes; keys must be 1 to {} bytes",
+                    crate::MAX_KEY_LEN
+                )
             }
             Error::ValueTooLarge(n) => {
                 write!(f, "value length {n} exceeds {}", crate::MAX_VALUE_LEN)

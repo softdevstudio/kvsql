@@ -317,3 +317,32 @@ fn deep_tree_grows_and_shrinks() {
         );
     }
 }
+
+/// Opening a file that is not a KvSQL database refuses it and leaves it as
+/// it was, however small it is.
+#[test]
+fn foreign_files_are_left_alone() {
+    let dir = std::env::temp_dir().join(format!("kvsql-foreign-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, body) in [
+        ("notes.txt", b"shopping list\n".to_vec()),
+        ("one-page.bin", vec![7u8; 4096]),
+        ("big.bin", vec![1u8; 20_000]),
+    ] {
+        let p = dir.join(name);
+        std::fs::write(&p, &body).unwrap();
+        assert!(kvsql_engine::Db::open(&p).is_err(), "{name} opened");
+        assert_eq!(std::fs::read(&p).unwrap(), body, "{name} changed");
+    }
+    // An empty file becomes a database.
+    let p = dir.join("empty.db");
+    std::fs::write(&p, b"").unwrap();
+    let db = kvsql_engine::Db::open(&p).unwrap();
+    db.put("k", b"a", b"1").unwrap();
+    drop(db);
+    assert_eq!(
+        kvsql_engine::Db::open(&p).unwrap().get("k", b"a").unwrap(),
+        Some(b"1".to_vec())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

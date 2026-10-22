@@ -801,7 +801,11 @@ pub fn read_value<R: PageRead>(r: &mut R, v: Val) -> Result<Vec<u8>> {
     match v {
         Val::Inline(b) => Ok(b),
         Val::Overflow { page, len } => {
-            let mut out = Vec::with_capacity(len as usize);
+            if len as usize > MAX_VALUE_LEN {
+                return corrupt("overflow value longer than the largest value");
+            }
+            // Grow as pages arrive; a damaged length must not reserve gigabytes.
+            let mut out = Vec::with_capacity((len as usize).min(1 << 20));
             let mut id = page;
             while out.len() < len as usize {
                 if id == 0 {
@@ -812,6 +816,9 @@ pub fn read_value<R: PageRead>(r: &mut R, v: Val) -> Result<Vec<u8>> {
                     return corrupt("overflow chain points at a non-overflow page");
                 }
                 let n = get_u32(&p, HEADER + 8) as usize;
+                if n == 0 {
+                    return corrupt("empty overflow page");
+                }
                 out.extend_from_slice(slice(&p, OVF_HDR, n)?);
                 id = get_u64(&p, HEADER);
             }
@@ -843,8 +850,15 @@ pub fn free_value<W: PageWrite>(w: &mut W, v: &Val) -> Result<()> {
 
 /// Free every page of a tree, including overflow chains.
 pub fn free_tree<W: PageWrite>(w: &mut W, root: u64) -> Result<()> {
+    free_tree_rec(w, root, 0)
+}
+
+fn free_tree_rec<W: PageWrite>(w: &mut W, root: u64, depth: usize) -> Result<()> {
     if root == 0 {
         return Ok(());
+    }
+    if depth > 64 {
+        return corrupt("tree deeper than 64 levels");
     }
     let p = w.read(root)?;
     match decode(&p)? {
@@ -855,7 +869,7 @@ pub fn free_tree<W: PageWrite>(w: &mut W, root: u64) -> Result<()> {
         }
         Node::Branch(cells) => {
             for c in &cells {
-                free_tree(w, c.child)?;
+                free_tree_rec(w, c.child, depth + 1)?;
             }
         }
     }

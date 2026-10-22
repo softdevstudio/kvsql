@@ -1,9 +1,9 @@
 //! Random SQL run on KvSQL and on SQLite (STRICT tables), answers compared.
 //!
-//! The generator keeps types consistent (no text compared with numbers),
-//! because SQLite's column affinity rules are out of scope; everything else
-//! it produces must give the same rows, the same changes, and the same
-//! success or failure on both engines.
+//! Most expressions keep types consistent, and a share of them compare text
+//! with numbers on purpose, so SQLite's comparison affinity is checked too.
+//! Everything the generator produces must give the same rows, the same
+//! changes, and the same success or failure on both engines.
 
 mod common;
 
@@ -19,10 +19,22 @@ CREATE TABLE t2 (k TEXT PRIMARY KEY, x INTEGER, y TEXT) STRICT;
 CREATE INDEX t1_a ON t1(a);
 CREATE INDEX t1_b ON t1(b);
 CREATE INDEX t2_x ON t2(x);
+CREATE TABLE t3 (id INTEGER PRIMARY KEY, n ANY, r REAL) STRICT;
+CREATE INDEX t3_n ON t3(n);
+CREATE INDEX t3_r ON t3(r);
 ";
 
+/// Values for the ANY and REAL columns of t3, and for comparing across types.
+const MIXED: [&str; 14] = [
+    "1", "1.0", "2", "-0.0", "0.0", "0", "'1'", "' 2'", "'1.5'", "'abc'", "'1e1'", "1.5", "NULL",
+    "x'01'",
+];
+const NUMERIC_TEXTS: [&str; 8] = [
+    "'1'", "'2'", "' 3 '", "'1.5'", "'1e1'", "'-4'", "'x'", "'10'",
+];
+
 const TEXTS: [&str; 9] = ["", "a", "ab", "abc", "B", "b", "x y", "Zed", "a%b"];
-const KEYS: [&str; 8] = ["k1", "k2", "k3", "kk", "m", "n", "z", "Q"];
+const KEYS: [&str; 10] = ["k1", "k2", "k3", "kk", "m", "n", "z", "Q", "2", "10"];
 const REALS: [f64; 6] = [-1.5, 0.0, 0.5, 2.0, 3.25, 100.0];
 const PATTERNS: [&str; 7] = ["a%", "%b%", "_", "%", "A_", "x%y", "%z%"];
 
@@ -180,6 +192,29 @@ impl Gen {
     fn bool_expr(&mut self, cols: Cols, depth: u32) -> String {
         let d = depth.saturating_sub(1);
         let cmp = *self.pick(&["=", "<>", "<", "<=", ">", ">="]);
+        if self.rng.chance(12) {
+            // Text against numbers: comparison affinity decides.
+            return match self.rng.below(4) {
+                0 => format!(
+                    "{} {cmp} {}",
+                    self.int_expr(cols, d),
+                    self.pick(&NUMERIC_TEXTS)
+                ),
+                1 => format!("{} {cmp} {}", self.text_expr(cols, d), self.int_lit()),
+                2 => format!(
+                    "{} IN ({}, {})",
+                    self.int_expr(cols, d),
+                    self.pick(&NUMERIC_TEXTS),
+                    self.int_lit()
+                ),
+                _ => format!(
+                    "{} BETWEEN {} AND {}",
+                    self.int_expr(cols, d),
+                    self.pick(&NUMERIC_TEXTS),
+                    self.pick(&NUMERIC_TEXTS)
+                ),
+            };
+        }
         match self.rng.below(if depth == 0 { 5 } else { 9 }) {
             0 => format!(
                 "{} {cmp} {}",
@@ -242,13 +277,18 @@ impl Gen {
         }
         let n = |g: &mut Gen| (g.rng.below(44) as i64 - 2).to_string();
         let cond = match cols {
-            Cols::T2 => match self.rng.below(4) {
+            Cols::T2 => match self.rng.below(6) {
+                4 => format!("k = {}", self.int_lit()),
+                5 => format!("x = {}", self.pick(&NUMERIC_TEXTS)),
                 0 => format!("k = '{}'", self.pick(&KEYS)),
                 1 => format!("k >= '{}'", self.pick(&KEYS)),
                 2 => format!("x = {}", self.int_lit()),
                 _ => format!("k IN ('{}', '{}')", self.pick(&KEYS), self.pick(&KEYS)),
             },
-            _ => match self.rng.below(9) {
+            _ => match self.rng.below(12) {
+                9 => format!("id = {}", self.pick(&NUMERIC_TEXTS)),
+                10 => format!("id < {}", self.pick(&NUMERIC_TEXTS)),
+                11 => format!("b = {}", self.int_lit()),
                 0 => format!("id = {}", n(self)),
                 1 => format!("id < {}", n(self)),
                 2 => format!("id <= {}", n(self)),
@@ -268,6 +308,15 @@ impl Gen {
     }
 
     fn insert(&mut self) -> String {
+        if self.rng.chance(15) {
+            let rows: Vec<String> = (0..1 + self.rng.below(3))
+                .map(|_| {
+                    let r = *self.pick(&["1", "1.0", "-0.0", "0.0", "0", "2.5", "NULL", "'3'"]);
+                    format!("({}, {}, {r})", 1 + self.rng.below(30), self.pick(&MIXED))
+                })
+                .collect();
+            return format!("INSERT INTO t3 VALUES {}", rows.join(", "));
+        }
         if self.rng.chance(60) {
             let rows: Vec<String> = (0..1 + self.rng.below(3))
                 .map(|_| {
@@ -349,6 +398,30 @@ impl Gen {
 
     /// A query and whether its row order is fully determined.
     fn query(&mut self) -> (String, bool) {
+        if self.rng.chance(12) {
+            let col = *self.pick(&["n", "r", "id"]);
+            let cmp = *self.pick(&["=", "=", "<", ">=", "<>"]);
+            let q = match self.rng.below(3) {
+                0 => format!(
+                    "SELECT id, n, r FROM t3 WHERE {col} {cmp} {} ORDER BY id",
+                    self.pick(&MIXED)
+                ),
+                1 => format!(
+                    "SELECT id FROM t3 WHERE {col} IN ({}, {}) ORDER BY id",
+                    self.pick(&MIXED),
+                    self.pick(&MIXED)
+                ),
+                _ => "SELECT typeof(n), count(*) FROM t3 GROUP BY 1 ORDER BY 1".to_string(),
+            };
+            return (q, true);
+        }
+        if self.rng.chance(6) {
+            let q = format!(
+                "SELECT a % 3, count(*), sum(d) FROM t1 WHERE {} GROUP BY 1 ORDER BY 1",
+                self.bool_expr(Cols::T1, 1)
+            );
+            return (q, true);
+        }
         match self.rng.below(6) {
             0 | 1 => {
                 let items: Vec<String> = (0..1 + self.rng.below(3))
@@ -519,6 +592,7 @@ fn random_sql_matches_sqlite() {
             for table in [
                 "SELECT * FROM t1 ORDER BY id",
                 "SELECT * FROM t2 ORDER BY k",
+                "SELECT * FROM t3 ORDER BY id",
             ] {
                 let t = sqlite_rows(&conn, table).unwrap();
                 let o = db.execute(table, &[]).unwrap().rows;

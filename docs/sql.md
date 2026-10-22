@@ -1,6 +1,6 @@
 # SQL reference
 
-KvSQL runs a subset of SQL close to SQLite with STRICT tables. Where a query falls inside the subset, it gives the same answer SQLite gives; the test suite checks this on random statements (see tests/sqlite_diff.rs).
+KvSQL runs a subset of SQL close to SQLite with STRICT tables. Where a query falls inside the subset, it gives the same answer SQLite gives; the test suite checks this on random statements, including comparisons between text and numbers (see tests/sqlite_diff.rs).
 
 ## Running SQL
 
@@ -57,6 +57,8 @@ SELECT [DISTINCT] items FROM t [AS a] [[INNER|LEFT|CROSS] JOIN t2 ON expr | , t2
   [ORDER BY expr|position|alias [ASC|DESC], ...] [LIMIT n [OFFSET m]]
 ```
 
+`GROUP BY` and `ORDER BY` take result column positions (`GROUP BY 1`) and aliases as well as expressions.
+
 Every table needs exactly one primary key column, of type INTEGER, TEXT or BLOB. An INTEGER primary key left out or given as NULL gets the largest existing key plus one.
 
 Types: INTEGER (also INT, BIGINT), REAL (FLOAT, DOUBLE), TEXT (VARCHAR), BLOB, ANY. Values are converted only when nothing is lost, as SQLite does for STRICT tables: 3.0 goes into an INTEGER column as 3, 3.5 is refused.
@@ -71,6 +73,16 @@ Not supported yet: subqueries, UNION, multi-column indexes or primary keys, ALTE
 - Aggregates: count(*), count(x), sum, total, avg, min, max, group_concat, each with optional DISTINCT.
 
 NULL and number rules follow SQLite: comparisons with NULL are unknown, integer division truncates, division or remainder by zero gives NULL, integer overflow in `+ - *` gives a REAL, and SUM of integers that overflows is an error.
+
+Comparisons between text and numbers follow SQLite's affinity rules. An INTEGER or REAL column has numeric affinity, a TEXT column text affinity, a BLOB or ANY column none, and `CAST(x AS type)` the affinity of its type. When one side of `=`, `<`, `IN`, `BETWEEN` and the like has numeric affinity, text on the other side that reads as a number is compared as that number, so `id = '7'` finds row 7. When one side has text affinity and the other none, numbers are compared as text. Values in an ANY column are not converted: there, 1 and 1.0 are equal but 1 and '1' are not.
+
+An expression can be nested at most 250 levels deep, and at most 64 levels of parentheses, function calls and signs; a chain of more than 250 of the same operator, such as `a + b + ...`, counts as that deep. Deeper SQL is refused with an error. Lists joined by AND or OR and `x IN (...)` lists have no such limit.
+
+## Sizes
+
+- Primary keys: an INTEGER of any value, or TEXT or BLOB of 1 to 512 bytes. An empty text or blob key is refused.
+- An indexed TEXT or BLOB value is stored in its index entry next to the row's key, and the two together must fit in 512 bytes. A longer value fails the INSERT or UPDATE, and CREATE INDEX fails on a table that already holds one.
+- Row values: up to 1 GiB per row.
 
 ## How queries find rows
 

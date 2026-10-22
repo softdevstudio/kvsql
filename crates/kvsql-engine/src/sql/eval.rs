@@ -56,6 +56,8 @@ pub enum E {
     Func(Func, Vec<E>),
     Cast(Box<E>, ColType),
     Case(Option<Box<E>>, Vec<(E, E)>, Option<Box<E>>),
+    /// Apply an affinity before a comparison.
+    Aff(Box<E>, Aff),
 }
 
 impl E {
@@ -64,7 +66,7 @@ impl E {
         match self {
             E::Lit(_) => true,
             E::Col(_) | E::Agg(_) => false,
-            E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) => a.is_const(),
+            E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) | E::Aff(a, _) => a.is_const(),
             E::Bin(_, a, b) | E::Like(a, b, _) => a.is_const() && b.is_const(),
             E::Between(a, b, c, _) => a.is_const() && b.is_const() && c.is_const(),
             E::In(a, l, _) => a.is_const() && l.iter().all(E::is_const),
@@ -92,7 +94,7 @@ impl E {
         f(self);
         match self {
             E::Lit(_) | E::Col(_) | E::Agg(_) => {}
-            E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) => a.visit(f),
+            E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) | E::Aff(a, _) => a.visit(f),
             E::Bin(_, a, b) | E::Like(a, b, _) => {
                 a.visit(f);
                 b.visit(f);
@@ -131,8 +133,77 @@ pub struct AggSpec {
     pub distinct: bool,
 }
 
-/// Columns visible to an expression: (table alias, column name) per position.
-pub type Scope = Vec<(String, String)>;
+/// Columns visible to an expression: (table alias, column name, type) per
+/// position.
+pub type Scope = Vec<(String, String, ColType)>;
+
+/// SQLite's comparison affinity. A STRICT column of type INTEGER or REAL has
+/// numeric affinity, TEXT has text affinity, BLOB and ANY have none. A CAST
+/// has the affinity of its type. Every other expression has none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aff {
+    Numeric,
+    Text,
+}
+
+fn type_aff(t: ColType) -> Option<Aff> {
+    match t {
+        ColType::Integer | ColType::Real => Some(Aff::Numeric),
+        ColType::Text => Some(Aff::Text),
+        _ => None,
+    }
+}
+
+/// Apply an affinity to a value the way SQLite does before a comparison.
+pub fn apply_aff(a: Aff, v: Value) -> Value {
+    match (a, v) {
+        (Aff::Numeric, Value::Text(s)) => match text_to_number(&s) {
+            Some(n) => n,
+            None => Value::Text(s),
+        },
+        (Aff::Text, Value::Int(i)) => Value::Text(i.to_string()),
+        (Aff::Text, Value::Real(r)) => Value::Text(fmt_real(r)),
+        (_, v) => v,
+    }
+}
+
+/// Text that is a well-formed number, as SQLite's numeric affinity sees it:
+/// optional spaces around an optional sign, digits, an optional fraction and
+/// an optional exponent.
+fn text_to_number(s: &str) -> Option<Value> {
+    let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    let body = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (mant, exp) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let (int_part, frac) = match mant.find('.') {
+        Some(i) => (&mant[..i], Some(&mant[i + 1..])),
+        None => (mant, None),
+    };
+    let digits = |x: &str| x.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int_part)
+        || !frac.is_none_or(digits)
+        || int_part.len() + frac.map_or(0, str::len) == 0
+    {
+        return None;
+    }
+    if let Some(e) = exp {
+        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if e.is_empty() || !digits(e) {
+            return None;
+        }
+    }
+    if frac.is_none() && exp.is_none() {
+        if let Ok(i) = t.trim_start_matches('+').parse::<i64>() {
+            return Some(Value::Int(i));
+        }
+    }
+    t.trim_start_matches('+')
+        .parse::<f64>()
+        .ok()
+        .map(Value::real)
+}
 
 pub struct Binder<'a> {
     pub scope: &'a Scope,
@@ -144,13 +215,36 @@ pub struct Binder<'a> {
     pub aliases: &'a [(String, Expr)],
 }
 
+fn is_comparison(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::Is
+            | BinOp::IsNot
+    )
+}
+
+/// Wrap `e` so the affinity is applied when it is evaluated. Constants are
+/// converted right away, which also lets the planner see a plain value.
+fn wrap_aff(e: E, a: Aff) -> E {
+    match e {
+        E::Lit(v) => E::Lit(apply_aff(a, v)),
+        e => E::Aff(Box::new(e), a),
+    }
+}
+
 fn sql_err<T>(m: impl Into<String>) -> Result<T> {
     Err(Error::Sql(m.into()))
 }
 
 pub fn resolve(scope: &Scope, table: Option<&str>, name: &str) -> Result<usize> {
     let mut found = None;
-    for (i, (t, c)) in scope.iter().enumerate() {
+    for (i, (t, c, _)) in scope.iter().enumerate() {
         let table_ok = table.is_none_or(|q| q.eq_ignore_ascii_case(t));
         if table_ok && c.eq_ignore_ascii_case(name) {
             if found.is_some() {
@@ -194,23 +288,55 @@ impl Binder<'_> {
             },
             Expr::Neg(a) => E::Neg(b(self, a)?),
             Expr::Not(a) => E::Not(b(self, a)?),
-            Expr::Bin(op, x, y) => E::Bin(*op, b(self, x)?, b(self, y)?),
+            Expr::Bin(op, x, y) => {
+                let (l, r) = (self.bind(x)?, self.bind(y)?);
+                if is_comparison(*op) {
+                    let (l, r) = self.compare_aff(l, r);
+                    E::Bin(*op, Box::new(l), Box::new(r))
+                } else {
+                    E::Bin(*op, Box::new(l), Box::new(r))
+                }
+            }
             Expr::IsNull(a, n) => E::IsNull(b(self, a)?, *n),
             Expr::In {
                 expr,
                 list,
                 negated,
-            } => E::In(
-                b(self, expr)?,
-                list.iter().map(|x| self.bind(x)).collect::<Result<_>>()?,
-                *negated,
-            ),
+            } => {
+                let x = self.bind(expr)?;
+                let mut items: Vec<E> = list.iter().map(|x| self.bind(x)).collect::<Result<_>>()?;
+                // The left side's affinity applies to every value in the list.
+                if let Some(a) = self.aff_of(&x) {
+                    items = items.into_iter().map(|e| wrap_aff(e, a)).collect();
+                }
+                E::In(Box::new(x), items, *negated)
+            }
             Expr::Between {
                 expr,
                 lo,
                 hi,
                 negated,
-            } => E::Between(b(self, expr)?, b(self, lo)?, b(self, hi)?, *negated),
+            } => {
+                let (x, l, h) = (self.bind(expr)?, self.bind(lo)?, self.bind(hi)?);
+                let (x1, l) = self.compare_aff(x.clone(), l);
+                let (x2, h) = self.compare_aff(x.clone(), h);
+                if matches!(x1, E::Aff(..)) || matches!(x2, E::Aff(..)) {
+                    // The two halves convert the middle value differently:
+                    // spell it out as x >= lo AND x <= hi.
+                    let both = E::Bin(
+                        BinOp::And,
+                        Box::new(E::Bin(BinOp::Ge, Box::new(x1), Box::new(l))),
+                        Box::new(E::Bin(BinOp::Le, Box::new(x2), Box::new(h))),
+                    );
+                    if *negated {
+                        E::Not(Box::new(both))
+                    } else {
+                        both
+                    }
+                } else {
+                    E::Between(Box::new(x), Box::new(l), Box::new(h), *negated)
+                }
+            }
             Expr::Like {
                 expr,
                 pattern,
@@ -242,6 +368,30 @@ impl Binder<'_> {
                 distinct,
             } => return self.bind_func(name, args, *star, *distinct),
         })
+    }
+
+    /// Comparison affinity of a bound expression.
+    fn aff_of(&self, e: &E) -> Option<Aff> {
+        match e {
+            E::Col(i) => self.scope.get(*i).and_then(|c| type_aff(c.2)),
+            E::Cast(_, t) => type_aff(*t),
+            E::Aff(_, a) => Some(*a),
+            _ => None,
+        }
+    }
+
+    /// SQLite's rules for the two sides of a comparison: if one side has
+    /// numeric affinity and the other text or none, the other side gets
+    /// numeric affinity; if one side has text affinity and the other none,
+    /// the other side gets text affinity.
+    fn compare_aff(&self, l: E, r: E) -> (E, E) {
+        match (self.aff_of(&l), self.aff_of(&r)) {
+            (Some(Aff::Numeric), Some(Aff::Text) | None) => (l, wrap_aff(r, Aff::Numeric)),
+            (Some(Aff::Text) | None, Some(Aff::Numeric)) => (wrap_aff(l, Aff::Numeric), r),
+            (Some(Aff::Text), None) => (l, wrap_aff(r, Aff::Text)),
+            (None, Some(Aff::Text)) => (wrap_aff(l, Aff::Text), r),
+            _ => (l, r),
+        }
     }
 
     fn bind_func(&mut self, name: &str, args: &[Expr], star: bool, distinct: bool) -> Result<E> {
@@ -763,6 +913,7 @@ pub fn eval(e: &E, row: &[Value], aggs: &[Value]) -> Result<Value> {
             call(*f, vals)?
         }
         E::Cast(a, t) => cast(eval(a, row, aggs)?, *t),
+        E::Aff(a, af) => apply_aff(*af, eval(a, row, aggs)?),
         E::Case(operand, whens, otherwise) => {
             let base = match operand {
                 Some(o) => Some(eval(o, row, aggs)?),

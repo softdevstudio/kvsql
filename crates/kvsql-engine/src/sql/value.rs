@@ -442,23 +442,22 @@ pub fn pk_value(t: ColType, key: &[u8]) -> Result<Value> {
     }
 }
 
-/// Order-preserving, prefix-free encoding of one value, used in index keys.
+/// Prefix-free encoding of one value, used in index keys. Values that
+/// compare equal in SQL encode the same: INTEGER and REAL share one numeric
+/// form (the value as an ordered f64, with -0.0 folded into 0.0), so 1 and
+/// 1.0 land on the same index entry prefix. Integers beyond 2^53 can share
+/// a prefix with a neighbour; lookups re-check the WHERE clause, so that
+/// only costs a row read.
 pub fn index_part(v: &Value, out: &mut Vec<u8>) {
     match v {
         Value::Null => out.push(0),
         Value::Int(i) => {
             out.push(1);
-            out.extend_from_slice(&((*i as u64) ^ (1 << 63)).to_be_bytes());
+            out.extend_from_slice(&ordered_f64(*i as f64));
         }
         Value::Real(r) => {
-            out.push(2);
-            let bits = r.to_bits();
-            let k = if bits >> 63 == 1 {
-                !bits
-            } else {
-                bits | (1 << 63)
-            };
-            out.extend_from_slice(&k.to_be_bytes());
+            out.push(1);
+            out.extend_from_slice(&ordered_f64(*r));
         }
         Value::Text(s) => {
             out.push(3);
@@ -469,6 +468,18 @@ pub fn index_part(v: &Value, out: &mut Vec<u8>) {
             escape(b, out);
         }
     }
+}
+
+/// Bytes whose order is the numeric order of `r`.
+fn ordered_f64(r: f64) -> [u8; 8] {
+    let r = if r == 0.0 { 0.0 } else { r };
+    let bits = r.to_bits();
+    let k = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    };
+    k.to_be_bytes()
 }
 
 fn escape(b: &[u8], out: &mut Vec<u8>) {

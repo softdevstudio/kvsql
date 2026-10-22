@@ -420,7 +420,7 @@ pub fn statement<K: KvWrite>(kv: &mut K, s: &Stmt, params: &[Value]) -> Result<Q
 fn table_scope(t: &Table, alias: &str) -> Scope {
     t.columns
         .iter()
-        .map(|c| (alias.to_string(), c.name.clone()))
+        .map(|c| (alias.to_string(), c.name.clone(), c.ty))
         .collect()
 }
 
@@ -845,6 +845,28 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         })
         .collect::<Result<_>>()?;
 
+    // GROUP BY takes result column positions the same way.
+    let group_terms: Vec<Expr> = sel
+        .group_by
+        .iter()
+        .map(|e| match e {
+            Expr::Lit(Value::Int(k)) => {
+                if *k < 1 || *k as usize > item_exprs.len() {
+                    return sql_err(format!(
+                        "GROUP BY term {k} is out of range: there are {} result columns",
+                        item_exprs.len()
+                    ));
+                }
+                let x = item_exprs[*k as usize - 1].clone();
+                if has_agg(&x) {
+                    return sql_err("aggregate functions are not allowed in the GROUP BY clause");
+                }
+                Ok(x)
+            }
+            e => Ok(e.clone()),
+        })
+        .collect::<Result<_>>()?;
+
     let aggregate = !sel.group_by.is_empty()
         || item_exprs.iter().any(has_agg)
         || sel.having.as_ref().is_some_and(has_agg)
@@ -933,7 +955,7 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
             .iter()
             .map(|(e, _)| bind_agg(e, &mut specs))
             .collect::<Result<_>>()?;
-        let group_exprs: Vec<E> = sel.group_by.iter().map(bind_late).collect::<Result<_>>()?;
+        let group_exprs: Vec<E> = group_terms.iter().map(bind_late).collect::<Result<_>>()?;
         let mut groups: BTreeMap<Vec<OrdVal>, (Vec<Value>, Vec<Acc>)> = BTreeMap::new();
         let width = scope.len();
         let mut emit = |_: &mut K, row: &[Value]| -> Result<bool> {

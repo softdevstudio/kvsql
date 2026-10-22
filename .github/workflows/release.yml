@@ -1,0 +1,220 @@
+name: Release
+
+# Runs after CI finishes on main. When the workspace version in Cargo.toml
+# has no tag yet, it builds kvsqld and kvsql for every target, smoke-tests
+# each build on its own platform, then tags the commit and publishes
+# "KvSQL vX.Y.Z". If any build or smoke test fails, nothing is published.
+#
+# Run it by hand with a tag to rebuild the files of an existing release.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to rebuild, such as v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    outputs:
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      sha: ${{ steps.plan.outputs.sha }}
+      rebuild: ${{ steps.plan.outputs.rebuild }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then echo "no version in Cargo.toml" >&2; exit 1; fi
+          sha=$(git rev-parse HEAD)
+          release=false
+          rebuild=false
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "v$version" != "$TAG_INPUT" ]; then
+              echo "tag $TAG_INPUT does not match Cargo.toml version $version" >&2; exit 1
+            fi
+            release=true
+            rebuild=true
+          elif git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already tagged; nothing to release"
+          else
+            release=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
+          echo "version $version at $sha: release=$release rebuild=$rebuild"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: kvsql-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: kvsql-linux-arm64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: kvsql-macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            name: kvsql-macos-x86_64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: kvsql-windows-x86_64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p kvsql-db --bins --target ${{ matrix.target }}
+      - name: Engine tests on this platform
+        run: cargo test --release --locked -p kvsql-engine --target ${{ matrix.target }}
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "${{ runner.os }}" = Windows ]; then ext=".exe"; fi
+          bin="target/${{ matrix.target }}/release"
+          "$bin/kvsqld$ext" --version
+          "$bin/kvsql$ext" --version
+          work=$(mktemp -d)
+          out=$("$bin/kvsql$ext" --file "$work/local.db" \
+            -c "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)" \
+            -c "INSERT INTO t VALUES (1, 'one'), (2, 'two')" \
+            -c ".put notes a hello" \
+            -c "SELECT count(*) AS n FROM t" \
+            -c ".get notes a" \
+            -c ".verify")
+          echo "$out"
+          echo "$out" | grep -qx "2"
+          echo "$out" | grep -qx "hello"
+          "$bin/kvsqld$ext" --db "$work/server.db" --listen 127.0.0.1:7979 > "$work/kvsqld.log" &
+          pid=$!
+          for i in $(seq 1 50); do
+            if curl -sf http://127.0.0.1:7979/health > /dev/null; then break; fi
+            sleep 0.2
+          done
+          curl -sf http://127.0.0.1:7979/sql -d "CREATE TABLE u (id INTEGER PRIMARY KEY, v TEXT)"
+          curl -sf http://127.0.0.1:7979/sql -d '{"sql":"INSERT INTO u VALUES (?, ?)","params":[7,"seven"]}'
+          row=$(curl -sf http://127.0.0.1:7979/rows/u/7)
+          echo "$row"
+          [ "$row" = '{"row":[7,"seven"]}' ]
+          out=$("$bin/kvsql$ext" --url http://127.0.0.1:7979 -c "SELECT v FROM u")
+          echo "$out" | grep -qx "seven"
+          if [ "${{ runner.os }}" = Windows ]; then
+            taskkill //F //IM kvsqld.exe > /dev/null || true
+          else
+            kill "$pid" || true
+          fi
+          wait "$pid" 2>/dev/null || true
+      - name: Package
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "${{ runner.os }}" = Windows ]; then ext=".exe"; fi
+          dir="${{ matrix.name }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/kvsqld$ext" "target/${{ matrix.target }}/release/kvsql$ext" "$dir/"
+          cp LICENSE NOTICE THIRD_PARTY_LICENSES.md README.md "$dir/"
+          if [ "${{ runner.os }}" = Windows ]; then
+            7z a -tzip "$dir.zip" "$dir" > /dev/null
+          else
+            tar -czf "$dir.tar.gz" "$dir"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.tar.gz
+            ${{ matrix.name }}.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REBUILD: ${{ needs.plan.outputs.rebuild }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if [ "$REBUILD" = true ]; then
+            gh release upload "$tag" dist/* --clobber --repo "$REPO"
+            exit 0
+          fi
+          cat > notes.md <<EOF
+          KvSQL $VERSION: KvSQL Engine and KvSQL DB.
+
+          Each archive holds \`kvsqld\` (the server) and \`kvsql\` (the shell). Check a download against \`SHA256SUMS\`. The engine is used as a Git dependency:
+
+          \`\`\`toml
+          kvsql-engine = { git = "https://github.com/$REPO", tag = "$tag" }
+          \`\`\`
+
+          Test and benchmark results for this commit are in [test/results/latest](https://github.com/$REPO/tree/$tag/test/results/latest). The manual is the [README](https://github.com/$REPO/blob/$tag/README.md).
+          EOF
+          gh release create "$tag" dist/* \
+            --repo "$REPO" \
+            --target "$SHA" \
+            --title "KvSQL $tag" \
+            --notes-file notes.md \
+            --latest
