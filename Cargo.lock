@@ -61,6 +61,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvsql-db"
+version = "0.1.0"
+dependencies = [
+ "kvsql-engine",
+]
+
+[[package]]
 name = "kvsql-engine"
 version = "0.1.0"
 dependencies = [

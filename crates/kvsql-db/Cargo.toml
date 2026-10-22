@@ -1,0 +1,23 @@
+[package]
+name = "kvsql-db"
+description = "KvSQL DB: the kvsqld server and kvsql shell, built on KvSQL Engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "kvsql_db"
+
+[[bin]]
+name = "kvsqld"
+path = "src/bin/kvsqld.rs"
+
+[[bin]]
+name = "kvsql"
+path = "src/bin/kvsql.rs"
+
+[dependencies]
+kvsql-engine = { path = "../kvsql-engine" }

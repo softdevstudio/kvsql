@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kvsql-engine"]
+members = ["crates/kvsql-engine", "crates/kvsql-db"]
 
 [workspace.package]
 version = "0.1.0"

@@ -88,8 +88,16 @@ October 22, 2026, session 3 (SQL) done:
 - Tests: tests/sql.rs (statements, constraints, statement rollback, joins, SQLite expression rules, the two doors on the same rows, plain keyspaces, snapshots, error messages); tests/sqlite_diff.rs (random statements on KvSQL and SQLite STRICT tables, answers, change counts and errors compared; rusqlite is a dev-dependency only); power_cut.rs gained SQL writes with two indexes under power cuts. 120,000 random statements over six seeds matched SQLite during development. Mutation checks: an off-by-one key range bound and stale index entries were both caught.
 - Rough numbers on the dev container (not recorded): get_row 1.7 µs, the same read through SQL 7.8 µs, put_row 13 µs, GROUP BY over 50,000 rows 18 ms.
 
-Next session starts at session 4: KvSQL DB. A second crate with kvsqld (HTTP/JSON for KV and SQL, std only if practical) and the kvsql shell, concurrent clients, and tests that kill the server mid-load.
+October 22, 2026, session 4 (KvSQL DB) done:
+
+- Second crate crates/kvsql-db, std only, depends on the engine by path. Modules: json (parser with a depth limit, writer, base64, Value mapping with BLOB as {"$blob": base64}), http (HTTP/1.1 request reader with keep-alive and Content-Length only, response writer, percent coding, a small keep-alive client), server (routes, error mapping, bearer token compared in constant time, thread per connection with a cap), shell (Backend over a server or a local file, dot commands, text tables, a multi-line script reader).
+- Binaries: kvsqld (--db, --listen, --token or KVSQL_TOKEN, --max-connections; prints its address on the first stdout line) and kvsql (--url or KVSQL_URL, --file, --token, repeatable -c, script input on stdin, exit 1 on any failure).
+- API: GET /health, GET /verify, GET /kv, GET /kv/{ks}?from&to&limit, GET/PUT/DELETE /kv/{ks}/{key}, GET /rows/{t}/{pk}, PUT /rows/{t}, DELETE /rows/{t}/{pk}, POST /sql. Each request is one transaction and writes answer after commit. Reference in docs/server.md; README has a server and shell section.
+- Tests: tests/api.rs (endpoints, statuses, binary keys, tokens, limits, malformed and pipelined requests), tests/server_load.rs (six writer and four reader connections with a constant money total; a real kvsqld SIGKILLed under load from four clients, then every acknowledged write checked in the file), tests/shell.rs (file and server mode, -c, stdin scripts, exit codes, kvsqld flags). record-results.sh gained KVSQL_SERVER_SECS (10) and KVSQL_SERVER_KILLS (100). Mutation check: a server that acknowledges some puts without writing them fails the kill test in the first round.
+- Recorded run (test/results/latest): 100 kvsqld SIGKILLs under load with 13,900 acknowledged writes all present afterwards; 10 s of six writer and four reader connections (5,451 transfer rounds, 113,335 total checks); all engine suites at the session 3 settings passed. Throughput there is a by-product of a stress test and not a benchmark.
+
+Next session starts at session 5: release. Benchmarks against SQLite (get against the same read through SQL), recorded results, independent review by a separate agent, fixes, the automated release workflow building both binaries for the five targets, and v0.1.0 published by CI.
 
 ## Next
 
-Session 4, after YK's go-ahead.
+Session 5, after YK's go-ahead.

@@ -7,7 +7,7 @@ There are two products:
 - **KvSQL Engine**, a Rust library you embed in your program. One file on disk, no server.
 - **KvSQL DB**, a database server and command-line shell built on the engine.
 
-Status: early development. The storage engine, key-value API, snapshot readers and SQL work and are tested. The server comes next. Nothing is released yet.
+Status: early development. The storage engine, key-value API, snapshot readers, SQL, the server and the shell work and are tested. Nothing is released yet.
 
 ## Why one store for both
 
@@ -87,6 +87,30 @@ A table is a keyspace of the same name, and each row sits under its primary key.
 
 The SQL is a subset close to SQLite with STRICT tables: CREATE/DROP TABLE and INDEX, INSERT, UPDATE, DELETE, and SELECT with joins, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, aggregates and the common functions. The full list, and what is missing, is in [docs/sql.md](docs/sql.md).
 
+## KvSQL DB: the server and the shell
+
+`kvsqld` serves one database file over HTTP with JSON, so programs in any language can use it. `kvsql` is a shell for people.
+
+```sh
+kvsqld --db app.db                      # listens on 127.0.0.1:7878
+kvsql -c "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"
+kvsql -c "INSERT INTO users VALUES (1, 'Ada')" -c ".row users 1"
+kvsql < schema.sql                      # run a script
+kvsql --file app.db                     # no server: open the file directly
+```
+
+The same two doors are there. `POST /sql` takes SQL; `GET /rows/users/1` and `GET /kv/sessions/s1` read straight from storage with no SQL in between.
+
+```sh
+curl -s localhost:7878/sql -d '{"sql":"SELECT name FROM users WHERE id = ?","params":[1]}'
+curl -s localhost:7878/rows/users/1
+curl -s -X PUT localhost:7878/kv/sessions/s1 --data-binary 'hello'
+```
+
+Each request is one transaction, and a write is answered only once its commit is on disk. A 200 means the data is safe even if the server is killed a moment later. Several SQL statements in one request succeed or fail together.
+
+Set `--token` (or `KVSQL_TOKEN`) to require a bearer token. There is no TLS, so keep the server on localhost or a private network, or put a proxy in front. Every endpoint, option and error is listed in [docs/server.md](docs/server.md).
+
 ## What a commit promises
 
 When `commit` returns, the transaction is on disk. If the program crashes or the power goes during a commit, reopening the file gives you either the whole transaction or none of it. Never part of one.
@@ -106,6 +130,8 @@ Only one process can open a file at a time. A second open gets `Error::Locked`.
 - A real writer process is killed with SIGKILL at random moments. Every commit it reported as done must be in the file.
 - Random SQL statements run on KvSQL and on SQLite side by side, and every answer, row count and error must match. The generator steers some WHERE clauses toward key and index lookups so the planner's shortcuts get checked too.
 - Power cuts during SQL writes: after each one the file verifies, every index matches its table exactly, and the table holds the state before the statement or after it.
+- Many HTTP clients write and read at once; readers must always see the same money total.
+- A real `kvsqld` is killed with SIGKILL while clients write to it. Every write that got a 200 must be in the file afterwards, and the file must verify.
 
 Run them all and record the output:
 

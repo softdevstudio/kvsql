@@ -1,12 +1,65 @@
-UTC: 2026-10-22T07:49:35Z
+UTC: 2026-10-22T08:21:02Z
 Host: Linux x86_64
 rustc 1.97.0 (2d8144b78 2026-07-07)
 cargo 1.97.0 (c980f4866 2026-06-30)
-Parent commit: 90f459ac34d57483b665d25f01dd3066b860f2c7
-Settings: KVSQL_POWER_CUTS=20000 KVSQL_MODEL_ROUNDS=2000 KVSQL_KILL_ROUNDS=200 KVSQL_CHURN_SECS=10 KVSQL_SQL_STMTS=30000
+Parent commit: e4c3ee515c3c77ae369d89c2c0524c0d3675d868
+Settings: KVSQL_POWER_CUTS=20000 KVSQL_MODEL_ROUNDS=2000 KVSQL_KILL_ROUNDS=200 KVSQL_CHURN_SECS=10 KVSQL_SQL_STMTS=30000 KVSQL_SERVER_SECS=10 KVSQL_SERVER_KILLS=100
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.02s
-   Compiling kvsql-engine v0.1.0 (/home/claude/kvsql/crates/kvsql-engine)
-    Finished `release` profile [optimized] target(s) in 1m 15s
+   Compiling kvsql-db v0.1.0 (/home/claude/kvsql/crates/kvsql-db)
+    Finished `release` profile [optimized] target(s) in 22.33s
+     Running unittests src/lib.rs (target/release/deps/kvsql_db-702cd93e5a8d5008)
+
+running 3 tests
+test json::tests::base64 ... ok
+test json::tests::round_trip ... ok
+test json::tests::values ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/kvsql.rs (target/release/deps/kvsql-acfa8d14ca78a271)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/kvsqld.rs (target/release/deps/kvsqld-f2a0939863891791)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/api.rs (target/release/deps/api-ce3542f6ac212d6b)
+
+running 6 tests
+test health_and_routing ... ok
+test kv_endpoints_with_binary_keys ... ok
+test limits_are_enforced ... ok
+test malformed_requests_get_clear_errors ... ok
+test sql_and_rows_endpoints ... ok
+test token_is_required_when_set ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/server_load.rs (target/release/deps/server_load-f812cac51faa0290)
+
+running 2 tests
+test concurrent_clients_see_consistent_totals ... concurrent clients: 5451 transfers from 6 writers, 113335 total checks from 4 readers in 10s
+ok
+test kill_server_under_load ... server kills: 100 SIGKILLs under load, 13900 acknowledged writes all present afterwards
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.95s
+
+     Running tests/shell.rs (target/release/deps/shell-bf37fd067f0d1fbc)
+
+running 4 tests
+test file_mode_commands ... ok
+test kvsqld_flags ... ok
+test server_mode_and_flags ... ok
+test stdin_scripts_and_failures ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
      Running unittests src/lib.rs (target/release/deps/kvsql_engine-1eddbfad4be2d5cf)
 
 running 10 tests
@@ -27,11 +80,11 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 running 2 tests
 test child_writer ... ok
-test sigkill_never_loses_an_acknowledged_commit ... sigkill: seed 1792655452312095076 (rerun with KVSQL_SEED=1792655452312095076)
-sigkill: 200 kills, 7823 commits acknowledged
+test sigkill_never_loses_an_acknowledged_commit ... sigkill: seed 1792657321601160224 (rerun with KVSQL_SEED=1792657321601160224)
+sigkill: 200 kills, 8568 commits acknowledged
 ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.75s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.09s
 
      Running tests/kv.rs (target/release/deps/kv-80102d8d71bdad94)
 
@@ -43,28 +96,28 @@ test file_is_reused_not_grown_forever ... ok
 test keyspaces_are_separate ... ok
 test large_values_round_trip ... ok
 test put_get_delete_scan ... ok
-test random_ops_match_model ... random_ops_match_model: seed 1792655460925411439 (rerun with KVSQL_SEED=1792655460925411439)
-final: VerifyReport { txid: 1785, page_count: 216, used_pages: 29, free_pages: 187, keyspaces: 3, keys: 108 }
+test random_ops_match_model ... random_ops_match_model: seed 1792657330615197885 (rerun with KVSQL_SEED=1792657330615197885)
+final: VerifyReport { txid: 1798, page_count: 171, used_pages: 50, free_pages: 121, keyspaces: 3, keys: 296 }
 ok
 test real_file_persists_and_locks ... ok
 test rejects_bad_input ... ok
 test rejects_files_that_are_not_kvsql ... ok
 test transaction_sees_its_own_writes_in_scans ... ok
 
-test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
 
      Running tests/power_cut.rs (target/release/deps/power_cut-92bfe5e6c0f6c3fc)
 
 running 3 tests
-test power_cut_during_sql_keeps_indexes_exact ... sql_power_cut: seed 1792655463004279819 (rerun with KVSQL_SEED=1792655463004279819)
-sql_power_cut: 6666 statements, 482 cut mid-commit, 1090 landed whole, 5576 rolled back or failed
+test power_cut_during_sql_keeps_indexes_exact ... sql_power_cut: seed 1792657332694943539 (rerun with KVSQL_SEED=1792657332694943539)
+sql_power_cut: 6666 statements, 773 cut mid-commit, 1111 landed whole, 5555 rolled back or failed
 ok
-test power_cut_never_loses_or_tears_a_commit ... power_cut: seed 1792655473995120259 (rerun with KVSQL_SEED=1792655473995120259)
-power_cut: 20000 rounds, 6113 cuts inside a commit (528 in-flight commits landed whole, 5585 rolled back whole), 23152 checks of a reader held across commits
+test power_cut_never_loses_or_tears_a_commit ... power_cut: seed 1792657346194819378 (rerun with KVSQL_SEED=1792657346194819378)
+power_cut: 20000 rounds, 6133 cuts inside a commit (490 in-flight commits landed whole, 5643 rolled back whole), 23028 checks of a reader held across commits
 ok
 test power_cut_while_creating_the_file ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.46s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 45.68s
 
      Running tests/snapshots.rs (target/release/deps/snapshots-a59b392bbfa4b8b6)
 
@@ -72,11 +125,11 @@ running 4 tests
 test open_reader_holds_pages_until_it_closes ... ok
 test reader_does_not_block_writer ... ok
 test reader_keeps_its_snapshot ... ok
-test readers_see_consistent_snapshots_under_churn ... snapshot_churn: seed 1792655502673836474 (rerun with KVSQL_SEED=1792655502673836474)
-snapshot_churn: 2552 commits, 543 reader checks, VerifyReport { txid: 2552, page_count: 1398, used_pages: 269, free_pages: 1129, keyspaces: 2, keys: 1045 }
+test readers_see_consistent_snapshots_under_churn ... snapshot_churn: seed 1792657378626902294 (rerun with KVSQL_SEED=1792657378626902294)
+snapshot_churn: 1780 commits, 942 reader checks, VerifyReport { txid: 1781, page_count: 1163, used_pages: 234, free_pages: 929, keyspaces: 2, keys: 931 }
 ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.24s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.28s
 
      Running tests/sql.rs (target/release/deps/sql-913ddf2b0763646f)
 
@@ -97,11 +150,17 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
      Running tests/sqlite_diff.rs (target/release/deps/sqlite_diff-05eab2c15dd75c49)
 
 running 1 test
-test random_sql_matches_sqlite ... sqlite_diff: seed 1792655512725451764 (rerun with KVSQL_SEED=1792655512725451764)
-sqlite_diff: 30000 statements (13431 writes, 16569 queries, 3719 failing on both), all answers match SQLite
+test random_sql_matches_sqlite ... sqlite_diff: seed 1792657389245237364 (rerun with KVSQL_SEED=1792657389245237364)
+sqlite_diff: 30000 statements (13441 writes, 16559 queries, 3700 failing on both), all answers match SQLite
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.35s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.30s
+
+   Doc-tests kvsql_db
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
    Doc-tests kvsql_engine
 
@@ -109,6 +168,6 @@ running 2 tests
 test crates/kvsql-engine/src/lib.rs - (line 33) ... ok
 test crates/kvsql-engine/src/lib.rs - (line 8) ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.13s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.26s
 
-PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut and SIGKILL tests
+PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests
