@@ -27,12 +27,28 @@
 //! # }
 //! ```
 //!
-//! SQL arrives in a later release and reads the same keyspaces.
+//! The same records answer SQL. A table is a keyspace; its rows are stored
+//! under their primary keys, so `get_row` and SQL reach the same bytes:
+//!
+//! ```
+//! # fn main() -> kvsql_engine::Result<()> {
+//! use kvsql_engine::{Db, sql::Value, sim::SimStorage, Options};
+//! # let db = Db::open_with(Box::new(SimStorage::new()), Options::default())?;
+//! db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &[])?;
+//! db.execute("INSERT INTO users VALUES (42, 'Ada')", &[])?;
+//! let row = db.get_row("users", &Value::Int(42))?;      // no SQL parsing
+//! assert_eq!(row, Some(vec![Value::Int(42), Value::Text("Ada".into())]));
+//! let r = db.execute("SELECT name FROM users WHERE id = ?", &[Value::Int(42)])?;
+//! assert_eq!(r.rows, vec![vec![Value::Text("Ada".into())]]);
+//! # Ok(())
+//! # }
+//! ```
 
 mod crc32;
 mod db;
 mod error;
 mod page;
+pub mod sql;
 mod storage;
 mod tree;
 

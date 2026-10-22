@@ -12,3 +12,7 @@ rust-version.workspace = true
 name = "kvsql_engine"
 
 [dependencies]
+
+[dev-dependencies]
+# Only for the differential tests that check SQL answers against SQLite.
+rusqlite = { version = "0.37", features = ["bundled"] }

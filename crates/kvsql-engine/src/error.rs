@@ -16,6 +16,11 @@ pub enum Error {
     ValueTooLarge(usize),
     /// A keyspace name is empty or longer than [`crate::MAX_KEY_LEN`].
     BadKeyspaceName,
+    /// A SQL statement could not be parsed or refers to something missing.
+    Sql(String),
+    /// A write broke a rule: duplicate primary key, NULL in a NOT NULL
+    /// column, a value of the wrong type, or a row that does not fit its table.
+    Constraint(String),
     /// An earlier write failed in a way that left this handle unsafe to use.
     /// Reopen the file to recover the last committed state.
     Poisoned,
@@ -34,6 +39,8 @@ impl fmt::Display for Error {
                 write!(f, "value length {n} exceeds {}", crate::MAX_VALUE_LEN)
             }
             Error::BadKeyspaceName => write!(f, "keyspace name is empty or too long"),
+            Error::Sql(m) => write!(f, "sql error: {m}"),
+            Error::Constraint(m) => write!(f, "constraint failed: {m}"),
             Error::Poisoned => write!(f, "handle is poisoned by an earlier failed write; reopen"),
         }
     }

@@ -150,3 +150,83 @@ fn power_cut_while_creating_the_file() {
         assert_eq!(db.get("t", b"k").unwrap(), Some(b"v".to_vec()));
     }
 }
+
+/// SQL writes with indexes, cut at random points. After every cut the file
+/// verifies (rows fit their tables, indexes match rows exactly) and holds
+/// the state before the statement or the state after it.
+#[test]
+fn power_cut_during_sql_keeps_indexes_exact() {
+    let seed = seed("sql_power_cut");
+    let mut rng = Rng::new(seed);
+    let rounds = env_u64("KVSQL_POWER_CUTS", 1500) / 3;
+    let setup = SimStorage::new();
+    let db = Db::open_with(Box::new(setup.clone()), Options::default()).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT);
+         CREATE INDEX t_a ON t(a); CREATE INDEX t_b ON t(b)",
+        &[],
+    )
+    .unwrap();
+    drop(db);
+    let mut image = setup.crash_image(&mut Rng::new(0));
+    let dump = |db: &Db| db.execute("SELECT * FROM t ORDER BY id", &[]).unwrap().rows;
+    let (mut landed, mut lost, mut cut) = (0, 0, 0);
+    for round in 0..rounds {
+        let ctx = format!("seed {seed} round {round}");
+        let stmt = match rng.below(4) {
+            0 | 1 => {
+                let rows: Vec<String> = (0..1 + rng.below(30))
+                    .map(|_| {
+                        format!(
+                            "({}, {}, '{}')",
+                            rng.below(400),
+                            rng.below(20),
+                            "v".repeat(rng.below(300) as usize)
+                        )
+                    })
+                    .collect();
+                format!("INSERT INTO t VALUES {}", rows.join(", "))
+            }
+            2 => format!(
+                "UPDATE t SET a = a + 1, b = b || 'x' WHERE id % {} = 0",
+                2 + rng.below(5)
+            ),
+            _ => format!("DELETE FROM t WHERE a = {}", rng.below(20)),
+        };
+        // What the statement does with no failure.
+        let clean = Db::open_with(
+            Box::new(SimStorage::from_image(image.clone())),
+            Options::default(),
+        )
+        .unwrap();
+        let before = dump(&clean);
+        let ok = clean.execute(&stmt, &[]).is_ok();
+        let after = dump(&clean);
+        drop(clean);
+
+        let storage = SimStorage::from_image(image.clone());
+        let db = Db::open_with(Box::new(storage.clone()), Options::default()).unwrap();
+        storage.fail_after(rng.below(40));
+        let r = db.execute(&stmt, &[]);
+        drop(db);
+        if matches!(r, Err(Error::Io(_))) {
+            cut += 1;
+        }
+        image = storage.crash_image(&mut rng);
+        let db = Db::open_with(
+            Box::new(SimStorage::from_image(image.clone())),
+            Options::default(),
+        )
+        .unwrap_or_else(|e| panic!("{ctx}: reopen: {e}"));
+        db.verify().unwrap_or_else(|e| panic!("{ctx}: verify: {e}"));
+        let got = dump(&db);
+        if ok && got == after && after != before {
+            landed += 1;
+        } else {
+            assert_eq!(got, before, "{ctx}: {stmt}: neither before nor after");
+            lost += 1;
+        }
+    }
+    eprintln!("sql_power_cut: {rounds} statements, {cut} cut mid-commit, {landed} landed whole, {lost} rolled back or failed");
+    assert!(cut > 0 && landed > 0);
+}

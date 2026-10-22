@@ -7,7 +7,7 @@ There are two products:
 - **KvSQL Engine**, a Rust library you embed in your program. One file on disk, no server.
 - **KvSQL DB**, a database server and command-line shell built on the engine.
 
-Status: early development. The storage engine, key-value API and snapshot readers work and are tested. SQL and the server come next. Nothing is released yet.
+Status: early development. The storage engine, key-value API, snapshot readers and SQL work and are tested. The server comes next. Nothing is released yet.
 
 ## Why one store for both
 
@@ -62,6 +62,31 @@ Committed data is never changed in place, which is what makes this work. Pages a
 
 `db.verify()` reads every page in the file and checks every rule the format depends on. It is the check the crash tests run after each simulated failure.
 
+## SQL on the same rows
+
+```rust
+use kvsql_engine::sql::Value;
+
+db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, city TEXT);
+            CREATE INDEX users_city ON users(city)", &[])?;
+db.execute("INSERT INTO users VALUES (1, 'Ada', 'London'), (2, 'Grace', 'New York')", &[])?;
+
+// The SQL door.
+let r = db.execute("SELECT name FROM users WHERE city = ?", &[Value::Text("London".into())])?;
+
+// The key door: same row, no parsing, no query plan.
+let row = db.get_row("users", &Value::Int(1))?;
+
+// Writes through the key door keep the index right too.
+let mut tx = db.begin_write()?;
+tx.put_row("users", &[Value::Int(3), Value::Text("Alan".into()), Value::Text("London".into())])?;
+tx.commit()?;
+```
+
+A table is a keyspace of the same name, and each row sits under its primary key. That is why both doors see the same bytes. A plain keyspace with no table definition reads in SQL as a two-column table, `key` and `value`.
+
+The SQL is a subset close to SQLite with STRICT tables: CREATE/DROP TABLE and INDEX, INSERT, UPDATE, DELETE, and SELECT with joins, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, aggregates and the common functions. The full list, and what is missing, is in [docs/sql.md](docs/sql.md).
+
 ## What a commit promises
 
 When `commit` returns, the transaction is on disk. If the program crashes or the power goes during a commit, reopening the file gives you either the whole transaction or none of it. Never part of one.
@@ -79,6 +104,8 @@ Only one process can open a file at a time. A second open gets `Error::Locked`.
 - Half the power-cut rounds keep a reader open across the commits; its view must not change.
 - Reader threads hold snapshots for random times while a writer moves money between accounts and churns pages. Every snapshot must show the same total twice and every value intact.
 - A real writer process is killed with SIGKILL at random moments. Every commit it reported as done must be in the file.
+- Random SQL statements run on KvSQL and on SQLite side by side, and every answer, row count and error must match. The generator steers some WHERE clauses toward key and index lookups so the planner's shortcuts get checked too.
+- Power cuts during SQL writes: after each one the file verifies, every index matches its table exactly, and the table holds the state before the statement or after it.
 
 Run them all and record the output:
 

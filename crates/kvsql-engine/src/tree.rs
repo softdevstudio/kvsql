@@ -988,3 +988,23 @@ fn verify_rec<R: PageRead>(
     }
     Ok(())
 }
+
+/// The largest key in a tree.
+pub fn last_key<R: PageRead>(r: &mut R, root: u64) -> Result<Option<Vec<u8>>> {
+    if root == 0 {
+        return Ok(None);
+    }
+    let mut id = root;
+    for _ in 0..64 {
+        let p = r.read(id)?;
+        let n = n_cells(&p)?;
+        if n == 0 {
+            return corrupt("empty tree page");
+        }
+        match kind(&p)? {
+            PageType::Leaf => return Ok(Some(leaf_key(&p, n - 1)?.to_vec())),
+            _ => id = branch_child(&p, n - 1)?,
+        }
+    }
+    corrupt("tree deeper than 64 levels")
+}

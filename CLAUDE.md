@@ -37,7 +37,7 @@ Every SQL table is also a keyspace: `get("users", key)` reads the row by primary
 
 Storage is a single file holding a copy-on-write B+tree per keyspace, a directory tree of keyspace roots, a persisted free list and two alternating meta pages. One writer at a time. The file format is in docs/file-format.md.
 
-The engine crate has no external dependencies. Release binaries target Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows x86_64. One release family, KvSQL vX.Y.Z, carries both binaries; the engine is used as a Git dependency (crates.io publishing would need YK's token and is not planned).
+The engine crate has no external dependencies (rusqlite is a dev-dependency for tests only). Release binaries target Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows x86_64. One release family, KvSQL vX.Y.Z, carries both binaries; the engine is used as a Git dependency (crates.io publishing would need YK's token and is not planned).
 
 ## Code and completion standard
 
@@ -80,8 +80,16 @@ October 22, 2026, session 2 (transactions) done:
 - Tests: tests/snapshots.rs (isolation, reader does not block writer, open reader holds pages then releases them, four reader threads checking a constant total and self-checking values twice per snapshot while a writer moves money and churns junk keys). power_cut.rs holds readers across commits in half the rounds and checks their view after each commit. Mutation checks: ignoring open readers when reusing pages, and tagging freed pages one commit early, both fail the churn test at once.
 - Rough numbers on the dev container (not recorded): about 5 µs per insert and 1.4 µs per get. Get got slower than session 1 because each one now registers a snapshot under the state mutex; worth revisiting in session 5 if benchmarks show contention.
 
-Next session starts at session 3: SQL. Tables stored as keyspaces with rows keyed by primary key, a catalog keyspace, parser, executor, secondary indexes kept in the same transaction, and random SQL compared against SQLite (rusqlite as a dev-dependency only).
+October 22, 2026, session 3 (SQL) done:
+
+- crates/kvsql-engine/src/sql: value.rs (Value, SQLite ordering, row encoding, primary-key and index-key encodings), parser.rs (tokenizer, AST, recursive descent), catalog.rs (table and index definitions in __kvsql_catalog, index keyspaces __kvsql_index:<name>, plain keyspaces as key/value tables), eval.rs (binding, SQLite NULL and number rules, functions, aggregates), exec.rs (access paths, nested-loop joins with key and index lookups, grouping, ordering, shared row writes), mod.rs (API glue, KV door hooks, verify).
+- API: Db::execute, Db::get_row, ReadTx::query and get_row, WriteTx::execute, get_row, put_row, delete_row. WriteTx put, delete and drop_keyspace now check table keyspaces (rows must fit, indexes kept, reserved names refused). Statements roll back alone through a savepoint (clones of the transaction's page maps).
+- Db::verify also checks every table row against its definition and every index entry against its rows.
+- Tests: tests/sql.rs (statements, constraints, statement rollback, joins, SQLite expression rules, the two doors on the same rows, plain keyspaces, snapshots, error messages); tests/sqlite_diff.rs (random statements on KvSQL and SQLite STRICT tables, answers, change counts and errors compared; rusqlite is a dev-dependency only); power_cut.rs gained SQL writes with two indexes under power cuts. 120,000 random statements over six seeds matched SQLite during development. Mutation checks: an off-by-one key range bound and stale index entries were both caught.
+- Rough numbers on the dev container (not recorded): get_row 1.7 µs, the same read through SQL 7.8 µs, put_row 13 µs, GROUP BY over 50,000 rows 18 ms.
+
+Next session starts at session 4: KvSQL DB. A second crate with kvsqld (HTTP/JSON for KV and SQL, std only if practical) and the kvsql shell, concurrent clients, and tests that kill the server mid-load.
 
 ## Next
 
-Session 3, after YK's go-ahead.
+Session 4, after YK's go-ahead.

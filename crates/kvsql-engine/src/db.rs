@@ -20,6 +20,7 @@ use crate::error::{corrupt, Error, Result};
 use crate::page::{
     self, get_u32, get_u64, new_page, put_u32, put_u64, PageType, HEADER, PAGE_SIZE,
 };
+use crate::sql::{self, QueryResult, SchemaCache, Value as SqlValue};
 use crate::storage::{FileStorage, Storage};
 use crate::tree::{self, Page, PageRead, PageWrite, TreeStats, Val, MAX_KEY_LEN, MAX_VALUE_LEN};
 
@@ -229,6 +230,7 @@ fn list_keyspaces<R: PageRead>(r: &mut R, dir_root: u64) -> Result<Vec<String>> 
     Ok(raw
         .into_iter()
         .map(|(k, _)| String::from_utf8_lossy(&k).into_owned())
+        .filter(|n| !sql::is_reserved(n))
         .collect())
 }
 
@@ -360,6 +362,7 @@ impl Db {
         Ok(ReadTx {
             shared: &self.shared,
             meta,
+            schemas: SchemaCache::default(),
         })
     }
 
@@ -399,6 +402,25 @@ impl Db {
         Ok(found)
     }
 
+    /// Run SQL in its own transaction. Read-only statements run on a
+    /// snapshot; anything else runs in one write transaction that commits
+    /// only if every statement succeeds. `?` placeholders take `params`.
+    pub fn execute(&self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
+        if sql::is_read_only(sql_text)? {
+            return self.begin_read()?.query(sql_text, params);
+        }
+        let mut tx = self.begin_write()?;
+        let r = tx.execute(sql_text, params)?;
+        tx.commit()?;
+        Ok(r)
+    }
+
+    /// KV door for tables: the row with this primary key, read straight from
+    /// storage with no SQL parsing.
+    pub fn get_row(&self, table: &str, pk: &SqlValue) -> Result<Option<Vec<SqlValue>>> {
+        self.begin_read()?.get_row(table, pk)
+    }
+
     /// Start a write transaction. Waits while another one is open. Nothing
     /// reaches the file until `commit`; dropping the transaction discards it.
     pub fn begin_write(&self) -> Result<WriteTx<'_>> {
@@ -435,6 +457,8 @@ impl Db {
             dir_root: base.dir_root,
             roots: HashMap::new(),
             changed: Vec::new(),
+            schemas: SchemaCache::default(),
+            savepoint: None,
         })
     }
 
@@ -452,6 +476,7 @@ impl Db {
         let mut r = ReadTx {
             shared: &self.shared,
             meta,
+            schemas: SchemaCache::default(),
         };
         *lock(&self.shared.state)
             .readers
@@ -493,6 +518,7 @@ impl Db {
                 return corrupt(format!("page {} is listed free twice", f.id));
             }
         }
+        sql::verify(&mut r)?;
         let accounted = seen.len() as u64 + free.len() as u64;
         if accounted != meta.page_count {
             return corrupt(format!(
@@ -515,6 +541,7 @@ impl Db {
 pub struct ReadTx<'a> {
     shared: &'a Shared,
     meta: Meta,
+    schemas: SchemaCache,
 }
 
 impl PageRead for ReadTx<'_> {
@@ -535,7 +562,46 @@ impl Drop for ReadTx<'_> {
     }
 }
 
+impl sql::Kv for ReadTx<'_> {
+    fn kv_get(&mut self, ks: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get(ks, key)
+    }
+    fn kv_scan(
+        &mut self,
+        ks: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan(ks, from, to, limit)
+    }
+    fn kv_exists(&mut self, ks: &str) -> Result<bool> {
+        let dir = self.meta.dir_root;
+        Ok(lookup_root(self, dir, ks.as_bytes())?.is_some())
+    }
+    fn kv_last_key(&mut self, ks: &str) -> Result<Option<Vec<u8>>> {
+        let dir = self.meta.dir_root;
+        match lookup_root(self, dir, ks.as_bytes())? {
+            Some(root) => tree::last_key(self, root),
+            None => Ok(None),
+        }
+    }
+    fn schemas(&mut self) -> &mut SchemaCache {
+        &mut self.schemas
+    }
+}
+
 impl ReadTx<'_> {
+    /// Run SELECT statements on this snapshot.
+    pub fn query(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
+        sql::query(self, sql_text, params)
+    }
+
+    /// KV door for tables: see [`Db::get_row`].
+    pub fn get_row(&mut self, table: &str, pk: &SqlValue) -> Result<Option<Vec<SqlValue>>> {
+        sql::get_row(self, table, pk)
+    }
+
     /// The commit this transaction sees.
     pub fn txid(&self) -> u64 {
         self.meta.txid
@@ -593,6 +659,22 @@ pub struct WriteTx<'a> {
     /// Keyspace roots seen or changed here; `None` means dropped or absent.
     roots: HashMap<Vec<u8>, Option<u64>>,
     changed: Vec<Vec<u8>>,
+    schemas: SchemaCache,
+    /// State at the start of the current SQL statement.
+    savepoint: Option<Box<Savepoint>>,
+}
+
+/// Everything a statement can change before commit.
+struct Savepoint {
+    dirty: HashMap<u64, Page>,
+    fresh: HashSet<u64>,
+    reusable: Vec<u64>,
+    held: Vec<Free>,
+    pending: Vec<u64>,
+    page_count: u64,
+    dir_root: u64,
+    roots: HashMap<Vec<u8>, Option<u64>>,
+    changed: Vec<Vec<u8>>,
 }
 
 impl PageRead for WriteTx<'_> {
@@ -636,6 +718,58 @@ impl PageWrite for WriteTx<'_> {
     }
 }
 
+impl sql::Kv for WriteTx<'_> {
+    fn kv_get(&mut self, ks: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.get(ks, key)
+    }
+    fn kv_scan(
+        &mut self,
+        ks: &str,
+        from: &[u8],
+        to: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan(ks, from, to, limit)
+    }
+    fn kv_exists(&mut self, ks: &str) -> Result<bool> {
+        Ok(self.root_of(ks.as_bytes())?.is_some())
+    }
+    fn kv_last_key(&mut self, ks: &str) -> Result<Option<Vec<u8>>> {
+        match self.root_of(ks.as_bytes())? {
+            Some(root) => tree::last_key(self, root),
+            None => Ok(None),
+        }
+    }
+    fn schemas(&mut self) -> &mut SchemaCache {
+        &mut self.schemas
+    }
+}
+
+impl sql::KvWrite for WriteTx<'_> {
+    fn kv_put(&mut self, ks: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.raw_put(ks, key, value)
+    }
+    fn kv_delete(&mut self, ks: &str, key: &[u8]) -> Result<bool> {
+        self.raw_delete(ks, key)
+    }
+    fn kv_create(&mut self, ks: &str) -> Result<()> {
+        check_name(ks)?;
+        if self.root_of(ks.as_bytes())?.is_none() {
+            self.set_root(ks.as_bytes(), Some(0));
+        }
+        Ok(())
+    }
+    fn kv_drop(&mut self, ks: &str) -> Result<bool> {
+        self.raw_drop(ks)
+    }
+    fn mark(&mut self) {
+        WriteTx::mark(self)
+    }
+    fn rollback(&mut self) {
+        WriteTx::rollback(self)
+    }
+}
+
 impl WriteTx<'_> {
     fn root_of(&mut self, name: &[u8]) -> Result<Option<u64>> {
         if let Some(r) = self.roots.get(name) {
@@ -675,7 +809,20 @@ impl WriteTx<'_> {
     }
 
     /// Insert or replace. Creates the keyspace if it does not exist.
+    ///
+    /// When the keyspace is a SQL table, `value` must be an encoded row
+    /// (see [`crate::sql::encode_row`]) whose primary key matches `key`; the
+    /// table's indexes are updated in the same transaction.
     pub fn put(&mut self, keyspace: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        check_name(keyspace)?;
+        check_key(key)?;
+        if sql::raw_put_hook(self, keyspace, key, value)? {
+            return Ok(());
+        }
+        self.raw_put(keyspace, key, value)
+    }
+
+    pub(crate) fn raw_put(&mut self, keyspace: &str, key: &[u8], value: &[u8]) -> Result<()> {
         check_name(keyspace)?;
         check_key(key)?;
         if value.len() > MAX_VALUE_LEN {
@@ -699,8 +846,16 @@ impl WriteTx<'_> {
         Ok(())
     }
 
-    /// Remove a key. Returns whether it existed.
+    /// Remove a key. Returns whether it existed. Deleting from a SQL table
+    /// also removes the row's index entries.
     pub fn delete(&mut self, keyspace: &str, key: &[u8]) -> Result<bool> {
+        if let Some(found) = sql::raw_delete_hook(self, keyspace, key)? {
+            return Ok(found);
+        }
+        self.raw_delete(keyspace, key)
+    }
+
+    pub(crate) fn raw_delete(&mut self, keyspace: &str, key: &[u8]) -> Result<bool> {
         let name = keyspace.as_bytes();
         let Some(root) = self.root_of(name)? else {
             return Ok(false);
@@ -716,7 +871,14 @@ impl WriteTx<'_> {
     }
 
     /// Remove a keyspace and everything in it. Returns whether it existed.
+    /// SQL tables are dropped with DROP TABLE instead.
     pub fn drop_keyspace(&mut self, keyspace: &str) -> Result<bool> {
+        sql::raw_drop_hook(self, keyspace)?;
+        self.schemas.clear();
+        self.raw_drop(keyspace)
+    }
+
+    pub(crate) fn raw_drop(&mut self, keyspace: &str) -> Result<bool> {
         let name = keyspace.as_bytes();
         let Some(root) = self.root_of(name)? else {
             return Ok(false);
@@ -732,6 +894,9 @@ impl WriteTx<'_> {
         let mut names: Vec<String> = list_keyspaces(self, dir)?;
         for (name, root) in &self.roots {
             let n = String::from_utf8_lossy(name).into_owned();
+            if sql::is_reserved(&n) {
+                continue;
+            }
             match root {
                 Some(_) if !names.contains(&n) => names.push(n),
                 None => names.retain(|x| *x != n),
@@ -740,6 +905,71 @@ impl WriteTx<'_> {
         }
         names.sort();
         Ok(names)
+    }
+
+    /// Run SQL statements in this transaction. A statement that fails is
+    /// undone on its own; earlier statements stay, and the transaction can
+    /// go on. `?` placeholders take `params`.
+    pub fn execute(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
+        sql::execute(self, sql_text, params)
+    }
+
+    /// KV door for tables: see [`Db::get_row`].
+    pub fn get_row(&mut self, table: &str, pk: &SqlValue) -> Result<Option<Vec<SqlValue>>> {
+        sql::get_row(self, table, pk)
+    }
+
+    /// KV door for tables: insert or replace a whole row by its primary key,
+    /// with no SQL parsing. Values are checked against the column types and
+    /// the table's indexes are kept up to date.
+    pub fn put_row(&mut self, table: &str, row: &[SqlValue]) -> Result<()> {
+        self.mark();
+        let r = sql::put_row(self, table, row.to_vec());
+        if r.is_err() {
+            self.rollback();
+        }
+        r
+    }
+
+    /// KV door for tables: delete a row by primary key. Returns whether it
+    /// existed.
+    pub fn delete_row(&mut self, table: &str, pk: &SqlValue) -> Result<bool> {
+        self.mark();
+        let r = sql::delete_row(self, table, pk);
+        if r.is_err() {
+            self.rollback();
+        }
+        r
+    }
+
+    fn mark(&mut self) {
+        self.savepoint = Some(Box::new(Savepoint {
+            dirty: self.dirty.clone(),
+            fresh: self.fresh.clone(),
+            reusable: self.reusable.clone(),
+            held: self.held.clone(),
+            pending: self.pending.clone(),
+            page_count: self.page_count,
+            dir_root: self.dir_root,
+            roots: self.roots.clone(),
+            changed: self.changed.clone(),
+        }));
+    }
+
+    fn rollback(&mut self) {
+        if let Some(sp) = self.savepoint.take() {
+            let sp = *sp;
+            self.dirty = sp.dirty;
+            self.fresh = sp.fresh;
+            self.reusable = sp.reusable;
+            self.held = sp.held;
+            self.pending = sp.pending;
+            self.page_count = sp.page_count;
+            self.dir_root = sp.dir_root;
+            self.roots = sp.roots;
+            self.changed = sp.changed;
+        }
+        self.schemas.clear();
     }
 
     /// Make every change durable, all at once.

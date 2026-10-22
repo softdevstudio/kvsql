@@ -7,6 +7,7 @@
 #   KVSQL_MODEL_ROUNDS model-check transaction rounds  (default here 2000)
 #   KVSQL_KILL_ROUNDS  real-process SIGKILL rounds     (default here 200)
 #   KVSQL_CHURN_SECS   readers-beside-writer stress    (default here 10)
+#   KVSQL_SQL_STMTS    random SQL checked vs SQLite    (default here 30000)
 #   KVSQL_SEED         replay one seed
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -15,6 +16,7 @@ export KVSQL_POWER_CUTS="${KVSQL_POWER_CUTS:-20000}"
 export KVSQL_MODEL_ROUNDS="${KVSQL_MODEL_ROUNDS:-2000}"
 export KVSQL_KILL_ROUNDS="${KVSQL_KILL_ROUNDS:-200}"
 export KVSQL_CHURN_SECS="${KVSQL_CHURN_SECS:-10}"
+export KVSQL_SQL_STMTS="${KVSQL_SQL_STMTS:-30000}"
 
 result_dir="test/results"
 mkdir -p "$result_dir"
@@ -29,11 +31,11 @@ printf 'Host: %s %s\n' "$(uname -s)" "$(uname -m)"
 rustc --version
 cargo --version
 printf 'Parent commit: %s\n' "$(git rev-parse HEAD 2>/dev/null || printf unknown)"
-printf 'Settings: KVSQL_POWER_CUTS=%s KVSQL_MODEL_ROUNDS=%s KVSQL_KILL_ROUNDS=%s KVSQL_CHURN_SECS=%s\n' \
-  "$KVSQL_POWER_CUTS" "$KVSQL_MODEL_ROUNDS" "$KVSQL_KILL_ROUNDS" "$KVSQL_CHURN_SECS"
+printf 'Settings: KVSQL_POWER_CUTS=%s KVSQL_MODEL_ROUNDS=%s KVSQL_KILL_ROUNDS=%s KVSQL_CHURN_SECS=%s KVSQL_SQL_STMTS=%s\n' \
+  "$KVSQL_POWER_CUTS" "$KVSQL_MODEL_ROUNDS" "$KVSQL_KILL_ROUNDS" "$KVSQL_CHURN_SECS" "$KVSQL_SQL_STMTS"
 
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --release -- --nocapture --test-threads=1
 
-printf 'PASS: formatting, clippy, unit, model, snapshot, power-cut and SIGKILL tests\n'
+printf 'PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut and SIGKILL tests\n'
