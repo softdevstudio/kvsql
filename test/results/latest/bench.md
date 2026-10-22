@@ -12,12 +12,12 @@
 
 | Operation | Time per read | Reads per second |
 |---|---|---|
-| KvSQL `get` on a plain keyspace | 1.67 µs | 598802 |
-| KvSQL `get_row` on the table (key door) | 2.32 µs | 430478 |
-| KvSQL `SELECT name FROM t WHERE id = ?` (SQL door) | 2.84 µs | 351617 |
-| SQLite `SELECT v FROM kv WHERE k = ?`, prepared | 3.09 µs | 323206 |
-| SQLite `SELECT name FROM t WHERE id = ?`, prepared | 3.55 µs | 282008 |
-| SQLite same query, parsed every time | 5.46 µs | 183318 |
+| KvSQL `get` on a plain keyspace | 1.13 µs | 888099 |
+| KvSQL `get_row` on the table (key door) | 1.56 µs | 638978 |
+| KvSQL `SELECT name FROM t WHERE id = ?` (SQL door) | 3.59 µs | 278242 |
+| SQLite `SELECT v FROM kv WHERE k = ?`, prepared | 3.54 µs | 282646 |
+| SQLite `SELECT name FROM t WHERE id = ?`, prepared | 2.66 µs | 376223 |
+| SQLite same query, parsed every time | 5.04 µs | 198216 |
 
 ## Point reads from 2 threads at once
 
@@ -25,45 +25,45 @@ Each thread reads every key once in its own shuffled order. SQLite gets one conn
 
 | Operation | Reads per second, all threads |
 |---|---|
-| KvSQL `get_row` | 665071 |
-| KvSQL SQL point select | 331054 |
-| SQLite prepared point select | 176392 |
+| KvSQL `get_row` | 786972 |
+| KvSQL SQL point select | 331275 |
+| SQLite prepared point select | 180134 |
 
 ## Range scan of 1000 consecutive keys
 
 | Operation | Time per scan | Scans per second |
 |---|---|---|
-| KvSQL `scan` on a plain keyspace | 152.5 µs | 6558 |
-| KvSQL SQL `WHERE id >= ? AND id < ?` | 630.6 µs | 1586 |
-| SQLite same query, prepared | 231.6 µs | 4317 |
+| KvSQL `scan` on a plain keyspace | 156.8 µs | 6379 |
+| KvSQL SQL `WHERE id >= ? AND id < ?` | 605.7 µs | 1651 |
+| SQLite same query, prepared | 346.6 µs | 2885 |
 
 ## Aggregate over the whole table
 
 | Operation | Time |
 |---|---|
-| KvSQL `SELECT score, count(*) FROM t GROUP BY score` | 41.14 ms |
-| SQLite same query | 34.22 ms |
+| KvSQL `SELECT score, count(*) FROM t GROUP BY score` | 39.87 ms |
+| SQLite same query | 27.27 ms |
 
 ## One small write per transaction, synced on every commit
 
 | Operation | Time per commit | Commits per second |
 |---|---|---|
-| KvSQL `put` and commit | 488.5 µs | 2047 |
-| KvSQL SQL `INSERT` and commit | 491.8 µs | 2033 |
-| SQLite prepared `INSERT INTO kv`, autocommit | 219.2 µs | 4563 |
-| SQLite prepared `INSERT INTO t`, autocommit | 204.9 µs | 4881 |
+| KvSQL `put` and commit | 509.1 µs | 1964 |
+| KvSQL SQL `INSERT` and commit | 437.7 µs | 2284 |
+| SQLite prepared `INSERT INTO kv`, autocommit | 237.4 µs | 4211 |
+| SQLite prepared `INSERT INTO t`, autocommit | 225.5 µs | 4434 |
 
 ## Bulk load in one transaction, and file size
 
 | Operation | KvSQL | SQLite |
 |---|---|---|
-| Load 100000 table rows | 404.79 ms | 74.92 ms |
-| Load 100000 plain keys | 343.25 ms | 156.95 ms |
+| Load 100000 table rows | 425.49 ms | 87.48 ms |
+| Load 100000 plain keys | 299.09 ms | 190.61 ms |
 | File size after the writes above | 7.0 MiB | 5.5 MiB |
 
 ## Summary
 
-- KvSQL `get_row` is 1.2x faster than the same row read through KvSQL SQL.
-- KvSQL `get_row` against SQLite's prepared point select: 1.53x the speed. KvSQL `get` against SQLite's prepared KV lookup: 1.85x.
-- KvSQL SQL point select against SQLite parsing each time: 1.92x the speed; against SQLite prepared: 1.25x.
+- KvSQL `get_row` is 2.3x faster than the same row read through KvSQL SQL.
+- KvSQL `get_row` against SQLite's prepared point select: 1.70x the speed. KvSQL `get` against SQLite's prepared KV lookup: 3.14x.
+- KvSQL SQL point select against SQLite parsing each time: 1.40x the speed; against SQLite prepared: 0.74x.
 - A figure above 1x means KvSQL is faster.

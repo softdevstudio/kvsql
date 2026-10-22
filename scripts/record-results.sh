@@ -47,4 +47,7 @@ cargo test --release -- --nocapture --test-threads=1
 # Benchmark against SQLite, saved on its own for the site.
 cargo run --release -q -p kvsql-engine --example bench | tee "$result_path/bench.md"
 
-printf 'PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests; benchmark saved to bench.md\n'
+# The case studies and use examples on kvsql.com, run for real.
+cargo run --release -q -p kvsql-db --example case_studies | tee "$result_path/case-studies.md"
+
+printf 'PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests; benchmark saved to bench.md; case studies saved to case-studies.md\n'

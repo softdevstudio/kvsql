@@ -1,12 +1,12 @@
-UTC: 2026-10-22T10:03:41Z
+UTC: 2026-10-22T10:40:42Z
 Host: Linux x86_64
 rustc 1.97.0 (2d8144b78 2026-07-07)
 cargo 1.97.0 (c980f4866 2026-06-30)
-Parent commit: f4c64d367f6c326030575cafcc3dd2acaaeec3ea
+Parent commit: e8c055478ff760b3bc470c572d8d1629a513d336
 Settings: KVSQL_POWER_CUTS=20000 KVSQL_MODEL_ROUNDS=2000 KVSQL_KILL_ROUNDS=200 KVSQL_CHURN_SECS=10 KVSQL_SQL_STMTS=30000 KVSQL_SERVER_SECS=10 KVSQL_SERVER_KILLS=100
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.05s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s
    Compiling kvsql-db v0.1.0 (/home/claude/kvsql/crates/kvsql-db)
-    Finished `release` profile [optimized] target(s) in 1m 17s
+    Finished `release` profile [optimized] target(s) in 19.85s
      Running unittests src/lib.rs (target/release/deps/kvsql_db-702cd93e5a8d5008)
 
 running 3 tests
@@ -45,12 +45,12 @@ test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
      Running tests/server_load.rs (target/release/deps/server_load-f812cac51faa0290)
 
 running 2 tests
-test concurrent_clients_see_consistent_totals ... concurrent clients: 6621 transfers from 6 writers, 145473 total checks from 4 readers in 10s
+test concurrent_clients_see_consistent_totals ... concurrent clients: 7502 transfers from 6 writers, 147523 total checks from 4 readers in 10s
 ok
-test kill_server_under_load ... server kills: 100 SIGKILLs under load, 15690 acknowledged writes all present afterwards
+test kill_server_under_load ... server kills: 100 SIGKILLs under load, 13390 acknowledged writes all present afterwards
 ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.70s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.26s
 
      Running tests/shell.rs (target/release/deps/shell-bf37fd067f0d1fbc)
 
@@ -60,7 +60,7 @@ test kvsqld_flags ... ok
 test server_mode_and_flags ... ok
 test stdin_scripts_and_failures ... ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
 
      Running unittests src/lib.rs (target/release/deps/kvsql_engine-1eddbfad4be2d5cf)
 
@@ -84,11 +84,11 @@ test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 
 running 2 tests
 test child_writer ... ok
-test sigkill_never_loses_an_acknowledged_commit ... sigkill: seed 1792663532131846859 (rerun with KVSQL_SEED=1792663532131846859)
-sigkill: 200 kills, 10693 commits acknowledged
+test sigkill_never_loses_an_acknowledged_commit ... sigkill: seed 1792665696374791845 (rerun with KVSQL_SEED=1792665696374791845)
+sigkill: 200 kills, 9736 commits acknowledged
 ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.70s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.74s
 
      Running tests/kv.rs (target/release/deps/kv-80102d8d71bdad94)
 
@@ -101,28 +101,28 @@ test foreign_files_are_left_alone ... ok
 test keyspaces_are_separate ... ok
 test large_values_round_trip ... ok
 test put_get_delete_scan ... ok
-test random_ops_match_model ... random_ops_match_model: seed 1792663540418082235 (rerun with KVSQL_SEED=1792663540418082235)
-final: VerifyReport { txid: 1797, page_count: 187, used_pages: 55, free_pages: 132, keyspaces: 3, keys: 277 }
+test random_ops_match_model ... random_ops_match_model: seed 1792665704836480966 (rerun with KVSQL_SEED=1792665704836480966)
+final: VerifyReport { txid: 1787, page_count: 167, used_pages: 92, free_pages: 75, keyspaces: 3, keys: 417 }
 ok
 test real_file_persists_and_locks ... ok
 test rejects_bad_input ... ok
 test rejects_files_that_are_not_kvsql ... ok
 test transaction_sees_its_own_writes_in_scans ... ok
 
-test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.68s
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.55s
 
      Running tests/power_cut.rs (target/release/deps/power_cut-92bfe5e6c0f6c3fc)
 
 running 3 tests
-test power_cut_during_sql_keeps_indexes_exact ... sql_power_cut: seed 1792663541523408235 (rerun with KVSQL_SEED=1792663541523408235)
-sql_power_cut: 6666 statements, 2216 cut mid-commit, 750 landed whole, 5916 rolled back or failed
+test power_cut_during_sql_keeps_indexes_exact ... sql_power_cut: seed 1792665705693039215 (rerun with KVSQL_SEED=1792665705693039215)
+sql_power_cut: 6666 statements, 2058 cut mid-commit, 790 landed whole, 5876 rolled back or failed
 ok
-test power_cut_never_loses_or_tears_a_commit ... power_cut: seed 1792663549603915501 (rerun with KVSQL_SEED=1792663549603915501)
-power_cut: 20000 rounds, 10588 cuts inside a commit (1578 in-flight commits landed whole, 9010 rolled back whole), 16492 checks of a reader held across commits
+test power_cut_never_loses_or_tears_a_commit ... power_cut: seed 1792665714310701632 (rerun with KVSQL_SEED=1792665714310701632)
+power_cut: 20000 rounds, 10514 cuts inside a commit (1613 in-flight commits landed whole, 8901 rolled back whole), 16673 checks of a reader held across commits
 ok
 test power_cut_while_creating_the_file ... ok
 
-test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.99s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.13s
 
      Running tests/snapshots.rs (target/release/deps/snapshots-a59b392bbfa4b8b6)
 
@@ -130,11 +130,11 @@ running 4 tests
 test open_reader_holds_pages_until_it_closes ... ok
 test reader_does_not_block_writer ... ok
 test reader_keeps_its_snapshot ... ok
-test readers_see_consistent_snapshots_under_churn ... snapshot_churn: seed 1792663566630286621 (rerun with KVSQL_SEED=1792663566630286621)
-snapshot_churn: 3252 commits, 853 reader checks, VerifyReport { txid: 3253, page_count: 1285, used_pages: 203, free_pages: 1082, keyspaces: 2, keys: 712 }
+test readers_see_consistent_snapshots_under_churn ... snapshot_churn: seed 1792665733043999341 (rerun with KVSQL_SEED=1792665733043999341)
+snapshot_churn: 3398 commits, 885 reader checks, VerifyReport { txid: 3399, page_count: 1218, used_pages: 238, free_pages: 980, keyspaces: 2, keys: 785 }
 ok
 
-test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.14s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.13s
 
      Running tests/sql.rs (target/release/deps/sql-913ddf2b0763646f)
 
@@ -154,16 +154,16 @@ test readers_query_snapshots ... ok
 test schema_cache_follows_keyspace_and_table_changes ... ok
 test update_delete_and_indexes ... ok
 
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.67s
 
      Running tests/sqlite_diff.rs (target/release/deps/sqlite_diff-05eab2c15dd75c49)
 
 running 1 test
-test random_sql_matches_sqlite ... sqlite_diff: seed 1792663578441972670 (rerun with KVSQL_SEED=1792663578441972670)
-sqlite_diff: 30000 statements (13417 writes, 16583 queries, 4028 failing on both), all answers match SQLite
+test random_sql_matches_sqlite ... sqlite_diff: seed 1792665745345319552 (rerun with KVSQL_SEED=1792665745345319552)
+sqlite_diff: 30000 statements (13610 writes, 16390 queries, 4004 failing on both), all answers match SQLite
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.61s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.25s
 
    Doc-tests kvsql_db
 
@@ -177,7 +177,7 @@ running 2 tests
 test crates/kvsql-engine/src/lib.rs - (line 33) ... ok
 test crates/kvsql-engine/src/lib.rs - (line 8) ... ok
 
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.63s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.49s
 
 # KvSQL benchmark
 
@@ -193,12 +193,12 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 | Operation | Time per read | Reads per second |
 |---|---|---|
-| KvSQL `get` on a plain keyspace | 1.67 µs | 598802 |
-| KvSQL `get_row` on the table (key door) | 2.32 µs | 430478 |
-| KvSQL `SELECT name FROM t WHERE id = ?` (SQL door) | 2.84 µs | 351617 |
-| SQLite `SELECT v FROM kv WHERE k = ?`, prepared | 3.09 µs | 323206 |
-| SQLite `SELECT name FROM t WHERE id = ?`, prepared | 3.55 µs | 282008 |
-| SQLite same query, parsed every time | 5.46 µs | 183318 |
+| KvSQL `get` on a plain keyspace | 1.13 µs | 888099 |
+| KvSQL `get_row` on the table (key door) | 1.56 µs | 638978 |
+| KvSQL `SELECT name FROM t WHERE id = ?` (SQL door) | 3.59 µs | 278242 |
+| SQLite `SELECT v FROM kv WHERE k = ?`, prepared | 3.54 µs | 282646 |
+| SQLite `SELECT name FROM t WHERE id = ?`, prepared | 2.66 µs | 376223 |
+| SQLite same query, parsed every time | 5.04 µs | 198216 |
 
 ## Point reads from 2 threads at once
 
@@ -206,46 +206,108 @@ Each thread reads every key once in its own shuffled order. SQLite gets one conn
 
 | Operation | Reads per second, all threads |
 |---|---|
-| KvSQL `get_row` | 665071 |
-| KvSQL SQL point select | 331054 |
-| SQLite prepared point select | 176392 |
+| KvSQL `get_row` | 786972 |
+| KvSQL SQL point select | 331275 |
+| SQLite prepared point select | 180134 |
 
 ## Range scan of 1000 consecutive keys
 
 | Operation | Time per scan | Scans per second |
 |---|---|---|
-| KvSQL `scan` on a plain keyspace | 152.5 µs | 6558 |
-| KvSQL SQL `WHERE id >= ? AND id < ?` | 630.6 µs | 1586 |
-| SQLite same query, prepared | 231.6 µs | 4317 |
+| KvSQL `scan` on a plain keyspace | 156.8 µs | 6379 |
+| KvSQL SQL `WHERE id >= ? AND id < ?` | 605.7 µs | 1651 |
+| SQLite same query, prepared | 346.6 µs | 2885 |
 
 ## Aggregate over the whole table
 
 | Operation | Time |
 |---|---|
-| KvSQL `SELECT score, count(*) FROM t GROUP BY score` | 41.14 ms |
-| SQLite same query | 34.22 ms |
+| KvSQL `SELECT score, count(*) FROM t GROUP BY score` | 39.87 ms |
+| SQLite same query | 27.27 ms |
 
 ## One small write per transaction, synced on every commit
 
 | Operation | Time per commit | Commits per second |
 |---|---|---|
-| KvSQL `put` and commit | 488.5 µs | 2047 |
-| KvSQL SQL `INSERT` and commit | 491.8 µs | 2033 |
-| SQLite prepared `INSERT INTO kv`, autocommit | 219.2 µs | 4563 |
-| SQLite prepared `INSERT INTO t`, autocommit | 204.9 µs | 4881 |
+| KvSQL `put` and commit | 509.1 µs | 1964 |
+| KvSQL SQL `INSERT` and commit | 437.7 µs | 2284 |
+| SQLite prepared `INSERT INTO kv`, autocommit | 237.4 µs | 4211 |
+| SQLite prepared `INSERT INTO t`, autocommit | 225.5 µs | 4434 |
 
 ## Bulk load in one transaction, and file size
 
 | Operation | KvSQL | SQLite |
 |---|---|---|
-| Load 100000 table rows | 404.79 ms | 74.92 ms |
-| Load 100000 plain keys | 343.25 ms | 156.95 ms |
+| Load 100000 table rows | 425.49 ms | 87.48 ms |
+| Load 100000 plain keys | 299.09 ms | 190.61 ms |
 | File size after the writes above | 7.0 MiB | 5.5 MiB |
 
 ## Summary
 
-- KvSQL `get_row` is 1.2x faster than the same row read through KvSQL SQL.
-- KvSQL `get_row` against SQLite's prepared point select: 1.53x the speed. KvSQL `get` against SQLite's prepared KV lookup: 1.85x.
-- KvSQL SQL point select against SQLite parsing each time: 1.92x the speed; against SQLite prepared: 1.25x.
+- KvSQL `get_row` is 2.3x faster than the same row read through KvSQL SQL.
+- KvSQL `get_row` against SQLite's prepared point select: 1.70x the speed. KvSQL `get` against SQLite's prepared KV lookup: 3.14x.
+- KvSQL SQL point select against SQLite parsing each time: 1.40x the speed; against SQLite prepared: 0.74x.
 - A figure above 1x means KvSQL is faster.
-PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests; benchmark saved to bench.md
+# KvSQL case studies and use examples
+
+- Host: linux x86_64, Intel(R) Xeon(R) Processor @ 2.80GHz, 2 hardware threads
+- KvSQL 0.1.0, release build, one run
+- Sessions and gateway: real files in the temp directory, every commit synced. Checkout: the simulated disk used by the power-cut tests
+
+## Case study: sessions and reporting in one store
+
+- 100000 sessions for 20,000 users, written in one transaction with `put_row`: 964.3 ms
+- 200000 random token lookups with `get_row`: 2.00 µs each, all found
+- The same lookups through `SELECT user_id FROM sessions WHERE token = ?`: 4.10 µs each
+- Dashboard query, live sessions per country over all 100000 rows: 53.5 ms (49586 live, 8 countries)
+- Revoking user 4242: 5 sessions before, 5 deleted through the index in 1.7 ms including the synced commit, 0 left; a reader opened before the delete still counted 5; `get_row` on one of the revoked tokens then found nothing
+- `verify` afterwards: 3747 pages, 199992 keys, every index entry matches its row
+
+## Case study: an edge gateway with kvsqld
+
+- 20 devices on their own connections sent 10000 readings, one request each, every request a synced transaction holding the history row and the latest value: 8.1 s, about 1236 requests a second
+- 2000 dashboard reads of `GET /rows/latest/dev-NN` over HTTP: 71.40 µs each, round trip included (last answer `{"row":["dev-19",1800014970,23.8]}`)
+- Per-device summary over all 10000 readings, top three by peak: 5.0 ms, answer `[["dev-07",500,22.83,34.9],["dev-00",500,22.03,25.9],["dev-01",500,22.01,25.9]]`
+- Alert query, readings over 30 °C: 3.4 ms, answer `[["dev-07",40,1800006000,1800007170]]` (device, count, first and last timestamp)
+- One device's history through the index: 0.6 ms, answer `[[500,22.83]]`
+- `GET /verify` afterwards: `{"ok":true,"txid":10001,"pages":327,"free_pages":7,"keyspaces":4,"keys":20023}`
+
+## Case study: a checkout that is never half done
+
+- The checkout reads the cart by key, inserts the order and three order lines and takes the stock through SQL, reads each price by key, and deletes the cart by key, all in one transaction. Its commit is 3 writes and 2 syncs on the simulated disk
+- Before: cart `kettlex1,mugx4,teapotx1`, stock [12, 40, 5, 9]. After: no cart, stock [11, 36, 4, 9], order 5001 total 9700 cents
+- Power cut after each of the 5 steps and after none, each cut replayed 200 ways (every unsynced write kept, none kept, any subset, subsets with torn sectors): 1200 reopened files
+- Every one passed `verify` and held either the shop before the checkout (794) or after it (406). None held an order without its stock taken, or a cart still there beside its order
+
+## Use example: a cache with expiry
+
+- 10,000 cached responses. `get_row` hit: true, miss: false. Sweep `DELETE FROM cache WHERE expires < 1300`: 5100 removed, 4900 left
+
+## Use example: settings read by key, audited by SQL
+
+- `get("settings", b"checkout.new_flow")` gives `on`. The same plain keyspace in SQL, with no schema, `WHERE CAST(key AS TEXT) LIKE 'search.%'`: `search.fuzzy = off`, `search.limit = 50`
+
+## Use example: the kvsql shell on a file
+
+```
+kvsql> CREATE TABLE jobs (id INTEGER PRIMARY KEY, kind TEXT, state TEXT)
+0 rows changed
+kvsql> INSERT INTO jobs VALUES (1, 'resize', 'done'), (2, 'resize', 'queued'), (3, 'email', 'queued')
+3 rows changed
+kvsql> SELECT state, count(*) AS n FROM jobs GROUP BY state
+state  | n
+-------+--
+done   | 1
+queued | 2
+(2 rows)
+kvsql> .row jobs 2
+2 | resize | queued
+kvsql> .put notes deploy shipped 0.1.0
+ok
+kvsql> .get notes deploy
+shipped 0.1.0
+kvsql> .verify
+ok: commit 3, 9 pages (2 free), 3 keyspaces, 5 keys
+```
+
+PASS: formatting, clippy, unit, model, snapshot, SQL, SQLite differential, power-cut, SIGKILL, server API, concurrent client and server-kill tests; benchmark saved to bench.md; case studies saved to case-studies.md
