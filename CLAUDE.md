@@ -120,7 +120,7 @@ What and why: the screening record says the differentiation has to be proven wit
 
 Design decisions:
 - A separate benchmark crate, bench/neighbours, outside the workspace with its own Cargo.lock, so the engine stays dependency-free and CI and releases don't build the neighbours. It depends on the engine by path and on redb 4.4.0, fjall 3.1.12 and GlueSQL 0.20.0 with its redb storage (each release at least two weeks old), and rusqlite as the existing reference.
-- Same machine, same data and real files for all: 100,000 keys (the existing bench's key and value shapes), loaded in one transaction, then timed warm in a shuffled order, median of five rounds. Measured where each store has the operation: key get; range scan of 100 keys; synced single-key commit (every store set to sync on commit: redb Immediate durability, fjall persist with SyncAll, KvSQL and SQLite as in the existing bench); point SQL select by primary key (KvSQL, GlueSQL, SQLite prepared); bulk load time and file size. Each store's cache set to 8 MiB where it has a setting, otherwise its default, stated in the output.
+- Same machine, same data and real files for all: 100,000 keys (the existing bench's key and value shapes), loaded in one transaction, then timed warm in a shuffled order, median of five rounds. Measured where each store has the operation: key get; range scan of 100 keys; synced single-key commit (every store set to sync on commit: redb Immediate durability, fjall persist with SyncData, the fdatasync KvSQL and SQLite use, GlueSQL autocommit, KvSQL and SQLite as in the existing bench); point SQL select by primary key (KvSQL, GlueSQL, SQLite prepared); bulk load time and file size. Each store's cache set to 8 MiB where it has a setting, otherwise its default, stated in the output.
 - The output, bench/neighbours/README.md for method and test/results/latest/neighbours.md for numbers, says what each figure measures and where the comparison isn't like for like (fjall is an LSM tree without SQL; GlueSQL is SQL over its own storage; redb is a B-tree without SQL). No verdict in the recording; the report to YK states the numbers and what they mean for the differentiation claim.
 - record-results.sh runs it; a CI job builds and runs it at a small size so it can't rot, on Linux.
 - Upkeep: a Windows CI job running the engine tests on every push.
@@ -128,8 +128,8 @@ Design decisions:
 
 Steps:
 1. [x] Phase 0: this plan.
-2. [ ] bench/neighbours crate and its README.
-3. [ ] record-results.sh and the CI jobs (neighbours at small size, Windows engine tests).
+2. [x] bench/neighbours crate and its README (GlueSQL's SQL reads use 10,000 of the shuffled keys, as each statement costs about 0.25 ms whatever the table size; sizes show file length and allocated bytes, since fjall preallocates a sparse 64 MiB journal).
+3. [x] record-results.sh and the CI jobs (neighbours at small size, Windows engine tests).
 4. [ ] Independent review of the method (one agent, at most two rounds), fixes.
 5. [ ] Recorded run; report to YK with the numbers for the go/no-go.
 

@@ -1,0 +1,23 @@
+[package]
+name = "kvsql-neighbours-bench"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Recorded benchmark of KvSQL against redb, fjall, GlueSQL and SQLite"
+
+# Its own workspace, so the KvSQL workspace, CI and releases never build these
+# dependencies, and the engine stays free of them.
+[workspace]
+
+[dependencies]
+kvsql-engine = { path = "../../crates/kvsql-engine" }
+redb = "=4.4.0"
+fjall = "=3.1.12"
+gluesql = { version = "=0.20.0", default-features = false, features = ["gluesql-redb-storage"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+futures = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1

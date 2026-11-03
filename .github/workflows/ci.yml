@@ -18,8 +18,34 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: bash scripts/record-results.sh
+        env:
+          # The neighbours benchmark has its own job below.
+          KVSQL_NEIGHBOURS: "0"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: results-${{ matrix.os }}
           path: test/results/
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - run: cargo test --release --locked -p kvsql-engine
+
+  neighbours:
+    # Builds and runs the benchmark against redb, fjall and GlueSQL at a
+    # small size so it can't rot. The recorded figures come from
+    # scripts/record-results.sh, not from this job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: rustfmt, clippy
+      - working-directory: bench/neighbours
+        run: |
+          cargo fmt -- --check
+          cargo clippy --release --locked -- -D warnings
+          KVSQL_NEIGHBOURS_ROWS=2000 KVSQL_NEIGHBOURS_COMMITS=20 cargo run --release --locked
