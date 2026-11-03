@@ -133,6 +133,26 @@ Steps:
 4. [x] Independent review of the method, two rounds. Round 1 blocker: every GlueSQL autocommit SELECT opened and committed a redb write transaction, so it synced to disk and the SQL row measured fsyncs (now its selects run in one transaction per round; autocommit kept as a labelled row over 500 keys). Should-fix, all fixed: fjall never left its 64 MiB memtable (now flushed and compacted after the load, its best case for reads), fixed store order on a noisy host (rounds interleaved, spread shown), checks on presence only (every value and scan key checked), sizes not comparable (said plainly). Nits fixed: Linux-only recording and the file system printed, fjall Snapshot::get, a drop guard, no ratio lines. Round 2: no blockers or should-fix; nits fixed (equal non-allocating checks, a KvSQL ReadTx::query row, commit count, fjall best-case wording).
 5. [x] Recorded run (test/results/latest/neighbours.md, Linux x86_64, 2 vCPUs, ext4, all checks passed). Reported to YK for the go/no-go.
 
+## KvSQL 0.2 Phase B: one sync per commit, prepared statements (YK said go on the Phase A numbers, 2026-11-03)
+
+What and why: Phase A showed KvSQL's synced commit at about 340 µs against SQLite WAL's 180 µs and fjall's 130 µs, because a commit syncs twice (pages, then meta). SQL point selects are 1.2 to 1.4x slower than SQLite's prepared statements; a callgrind profile puts most of the gap in per-call allocation (column scope, names, cloned expressions, table lookup), not in parsing, which is already cached.
+
+Design decisions:
+- Single-sync commit, file format version 2. A commit writes its pages, a commit record (one or more record pages listing every page id the commit wrote with that page's CRC-32C) and the meta page, then syncs once. The meta page gains the record's first page and entry count. On open, the newest meta page is accepted only if every page in its record reads back with a valid seal and the recorded CRC; otherwise open falls back to the other meta page (whose commit was fully synced before this one began, because a commit only returns after its sync). Record pages come from the same pool as other new pages and are freed by the next commit, like the old free-list pages. Version 1 files open as before (their commits were synced twice) and become version 2 at their first commit; 0.1 cannot open a file after that, which the README and CHANGELOG say.
+- Prepared statements: `Db::prepare(sql)` returns a `Statement` tied to that handle (parameter count checked up front). `Db::execute_prepared`, `ReadTx::query_prepared` and `WriteTx::execute_prepared` run it without the parse-cache lookup. For SELECT, a statement keeps its compiled plan (tables, column scope, bound expressions with parameter slots, access path) for the schema generation it was compiled at and reuses it while the schema stays the same; parameters are put into a copy of the plan's expressions at each run, with the same affinity rules as binding them directly. Writes, and reads inside a write transaction, use the parsed form only. The same compiled-plan path serves plain `execute` when it is cheap to do so; otherwise plain `execute` is unchanged.
+- Tests: power-cut and SIGKILL suites unchanged and passing; new tests for a commit whose data pages never reached the disk but whose meta page did (open falls back), a torn record page, a version 1 file opened, written and reopened, Db::verify accounting for record pages; prepared statements give the same answers, errors and change counts as `execute` (the SQLite differential test runs each statement both ways), plans are recompiled after a schema change, a statement from another handle is refused.
+- Benchmarks: bench.md and neighbours.md gain prepared-statement rows.
+- Version 0.2.0. Site: a release post, the reference page, the benchmark numbers from Phase A and 0.2.0. Studio note.
+
+Steps:
+1. [x] Phase 0: this plan.
+2. [ ] Single-sync commit, format version 2, docs/file-format.md, tests.
+3. [ ] Prepared statements with cached SELECT plans, tests.
+4. [ ] Benchmarks, README, CHANGELOG/NOTICE upkeep.
+5. [ ] Independent review (at most two rounds), fixes, fresh test/results.
+6. [ ] 0.2.0 released by the workflow; assets checked at the tag and latest; downloaded binary run.
+7. [ ] kvsql.com post and pages; softdevstudio.com note; softdev-plan item 25 done.
+
 ## Next
 
-Phase A of KvSQL 0.2 is done: the numbers are recorded and reported. Phase B (single-sync commit, prepared statements) and anything else wait for YK's go/no-go. The site gets the numbers only after his decision.
+Phase B of KvSQL 0.2 is in progress (above).
