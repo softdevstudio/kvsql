@@ -7,9 +7,13 @@
 //! KVSQL_NEIGHBOURS_ROWS sets the key and row count (default 100000) and
 //! KVSQL_NEIGHBOURS_COMMITS the synced commits per round (default 200).
 
+#![allow(clippy::needless_range_loop)]
+
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use fjall::Readable;
 use gluesql::core::data::Value as GValue;
 use gluesql::core::executor::Payload;
 use gluesql::core::prelude::Glue;
@@ -32,11 +36,23 @@ fn env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn workdir() -> PathBuf {
-    let p = std::env::temp_dir().join(format!("kvsql-neighbours-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
+/// The temp folder holding every store's files, removed on drop (also when
+/// a check panics).
+struct WorkDir(PathBuf);
+
+impl WorkDir {
+    fn new() -> WorkDir {
+        let p = std::env::temp_dir().join(format!("kvsql-neighbours-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        WorkDir(p)
+    }
+}
+
+impl Drop for WorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// File lengths and allocated bytes under a path (a file, or every file
@@ -69,19 +85,6 @@ fn sqlite_size(p: &Path) -> (u64, u64) {
         .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1))
 }
 
-/// Median over rounds of the time per operation.
-fn per_op(ops: usize, mut round: impl FnMut()) -> Duration {
-    let mut times: Vec<Duration> = (0..ROUNDS)
-        .map(|_| {
-            let t = Instant::now();
-            round();
-            t.elapsed() / ops as u32
-        })
-        .collect();
-    times.sort();
-    times[ROUNDS / 2]
-}
-
 fn fmt(d: Duration) -> String {
     let ns = d.as_nanos();
     if ns < 10_000 {
@@ -93,20 +96,62 @@ fn fmt(d: Duration) -> String {
     }
 }
 
-fn row(label: &str, d: Duration) {
-    println!(
-        "| {label} | {} | {:.0} |",
-        fmt(d),
-        1e9 / d.as_nanos().max(1) as f64
-    );
-}
-
 fn mib(b: u64) -> String {
     format!("{:.1} MiB", b as f64 / 1048576.0)
 }
 
 fn sizes((len, alloc): (u64, u64)) -> String {
     format!("{} | {}", mib(len), mib(alloc))
+}
+
+/// One timed operation: `ops` operations per round.
+struct Case<'a> {
+    label: String,
+    ops: usize,
+    run: Box<dyn FnMut() + 'a>,
+}
+
+fn case<'a>(label: &str, ops: usize, run: impl FnMut() + 'a) -> Case<'a> {
+    Case {
+        label: label.to_string(),
+        ops,
+        run: Box::new(run),
+    }
+}
+
+/// Runs the cases interleaved: round r runs every case once, starting at a
+/// different case each round, so a slow stretch on the host is spread over
+/// the stores instead of landing on one. Prints the median per operation
+/// and the fastest and slowest round.
+fn table(what: &str, cases: Vec<Case<'_>>) {
+    let mut cases = cases;
+    let mut times: Vec<Vec<Duration>> = vec![Vec::new(); cases.len()];
+    for r in 0..ROUNDS {
+        for k in 0..cases.len() {
+            let i = (r + k) % cases.len();
+            let c = &mut cases[i];
+            let t = Instant::now();
+            (c.run)();
+            times[i].push(t.elapsed() / c.ops as u32);
+        }
+    }
+    println!(
+        "| Store and call | Median per {what} | Fastest to slowest round | Per second (median) |"
+    );
+    println!("|---|---|---|---|");
+    for (c, t) in cases.iter().zip(times.iter_mut()) {
+        t.sort();
+        let med = t[ROUNDS / 2];
+        println!(
+            "| {} | {} | {} to {} | {:.0} |",
+            c.label,
+            fmt(med),
+            fmt(t[0]),
+            fmt(t[ROUNDS - 1]),
+            1e9 / med.as_nanos().max(1) as f64
+        );
+    }
+    println!();
 }
 
 fn key(i: usize) -> [u8; 8] {
@@ -153,6 +198,18 @@ fn host() -> String {
     format!("{os} {arch}, {cpu}, {threads} hardware threads")
 }
 
+/// The file system type of a folder, where `stat` can tell.
+fn fs_type(p: &Path) -> String {
+    std::process::Command::new("stat")
+        .args(["-f", "-c", "%T"])
+        .arg(p)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn glue_rows(p: Vec<Payload>) -> Vec<Vec<GValue>> {
     match p.into_iter().next() {
         Some(Payload::Select { rows, .. }) => rows,
@@ -164,16 +221,18 @@ fn main() {
     let n = env("KVSQL_NEIGHBOURS_ROWS", 100_000);
     let commits = env("KVSQL_NEIGHBOURS_COMMITS", 200);
     let order = shuffled(n, 7);
-    // GlueSQL takes about a quarter of a millisecond per statement whatever
-    // the table size, so its reads use the first 10000 keys of the same
-    // shuffled order to keep the run short.
-    let glue_order: Vec<usize> = order.iter().copied().take(10_000).collect();
     let starts: Vec<usize> = shuffled(n - SCAN_LEN, 11).into_iter().take(500).collect();
-    let dir = workdir();
-    let value = |i: usize| name_of(i).into_bytes();
+    let values: Vec<Vec<u8>> = (0..n).map(|i| name_of(i).into_bytes()).collect();
+    let names: Vec<String> = (0..n).map(name_of).collect();
+    // GlueSQL's autocommit select syncs to disk on every statement (see the
+    // README), so that row reads only this many keys per round.
+    let auto_order: Vec<usize> = order.iter().copied().take(500).collect();
+    let work = WorkDir::new();
+    let dir = &work.0;
 
     println!("# KvSQL and its neighbours\n");
     println!("- Host: {}", host());
+    println!("- Temp folder file system: {}", fs_type(dir));
     println!(
         "- KvSQL {}, redb 4.4.0, fjall 3.1.12, GlueSQL 0.20.0 on its redb storage (which uses redb 2.6), SQLite {} (bundled with rusqlite)",
         kvsql_engine::VERSION,
@@ -181,18 +240,19 @@ fn main() {
     );
     println!("- {n} keys (8-byte big-endian key, 13-byte value) and, for the SQL stores, {n} rows in `t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)`");
     println!("- Real files in one temp folder, one thread. Cache: 8 MiB for KvSQL (2048 pages), redb, fjall (block cache) and SQLite; GlueSQL's redb storage has no cache setting and runs with redb's default");
-    println!("- Reads: warm, shuffled key order, every key once per round, median of {ROUNDS} rounds. Scans: {} scans of {SCAN_LEN} consecutive keys from shuffled start keys", starts.len());
+    println!("- fjall's data is flushed from its memtable to on-disk tables and compacted after the load, so its reads go through its tables and block cache");
+    println!("- Reads: warm, shuffled key order, every key once per round, and every value read is checked. {ROUNDS} rounds, interleaved across the stores (each round runs every store once, starting with a different one); each row gives the median and the fastest and slowest round");
+    println!("- Scans: {} scans of {SCAN_LEN} consecutive keys from shuffled start keys, first key and count checked", starts.len());
     println!("- Synced commits: {commits} per round, each one small write synced to disk before the call returns (KvSQL commit, redb Durability::Immediate, fjall insert then persist(SyncData), GlueSQL autocommit on redb, SQLite WAL with synchronous=FULL)\n");
 
     // ---------------------------------------------------------------- load
-    // KvSQL
     let kpath = dir.join("kvsql.db");
     let kdb = Db::open(&kpath).unwrap();
     let t = Instant::now();
     {
         let mut tx = kdb.begin_write().unwrap();
         for i in 0..n {
-            tx.put("kv", &key(i), &value(i)).unwrap();
+            tx.put("kv", &key(i), &values[i]).unwrap();
         }
         tx.commit().unwrap();
     }
@@ -220,7 +280,6 @@ fn main() {
     }
     let k_load_rows = t.elapsed();
 
-    // redb
     let rpath = dir.join("redb.db");
     let rdb = redb::Database::builder()
         .set_cache_size(CACHE)
@@ -232,14 +291,13 @@ fn main() {
         {
             let mut table = tx.open_table(KV).unwrap();
             for i in 0..n {
-                table.insert(&key(i)[..], &value(i)[..]).unwrap();
+                table.insert(&key(i)[..], &values[i][..]).unwrap();
             }
         }
         tx.commit().unwrap();
     }
     let r_load = t.elapsed();
 
-    // fjall
     let fpath = dir.join("fjall");
     let fdb = fjall::Database::builder(&fpath)
         .cache_size(CACHE as u64)
@@ -252,34 +310,38 @@ fn main() {
     {
         let mut b = fdb.batch();
         for i in 0..n {
-            b.insert(&fks, key(i), value(i));
+            b.insert(&fks, key(i), values[i].clone());
         }
         b.commit().unwrap();
         fdb.persist(fjall::PersistMode::SyncData).unwrap();
     }
     let f_load = t.elapsed();
+    let t = Instant::now();
+    fks.rotate_memtable_and_wait().unwrap();
+    fks.major_compact().unwrap();
+    let f_flush = t.elapsed();
 
-    // GlueSQL
     let gpath = dir.join("gluesql.redb");
-    let mut glue = Glue::new(RedbStorage::new(&gpath).unwrap());
-    glue.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+    let glue = RefCell::new(Glue::new(RedbStorage::new(&gpath).unwrap()));
+    glue.borrow_mut()
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
         .unwrap();
     let t = Instant::now();
     {
-        glue.execute("BEGIN").unwrap();
+        let mut g = glue.borrow_mut();
+        g.execute("BEGIN").unwrap();
         for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
-            let values: Vec<String> = chunk
+            let vals: Vec<String> = chunk
                 .iter()
                 .map(|&i| format!("({i}, '{}', {})", name_of(i), i % 1000))
                 .collect();
-            glue.execute(format!("INSERT INTO t VALUES {}", values.join(", ")))
+            g.execute(format!("INSERT INTO t VALUES {}", vals.join(", ")))
                 .unwrap();
         }
-        glue.execute("COMMIT").unwrap();
+        g.execute("COMMIT").unwrap();
     }
     let g_load = t.elapsed();
 
-    // SQLite
     let spath = dir.join("sqlite.db");
     let conn = Connection::open(&spath).unwrap();
     conn.execute_batch(
@@ -293,7 +355,7 @@ fn main() {
         let tx = conn.unchecked_transaction().unwrap();
         let mut st = tx.prepare("INSERT INTO kv VALUES (?, ?)").unwrap();
         for i in 0..n {
-            st.execute(params![key(i).to_vec(), value(i)]).unwrap();
+            st.execute(params![key(i).to_vec(), values[i]]).unwrap();
         }
         drop(st);
         tx.commit().unwrap();
@@ -315,227 +377,269 @@ fn main() {
     // ------------------------------------------------------------ key gets
     println!("## Key get, one call per read\n");
     println!("Each call reads one key through the store's plain key-value door and sees the latest commit (KvSQL `Db::get`, a redb read transaction per get, fjall `Keyspace::get`, SQLite autocommit prepared select).\n");
-    println!("| Store and call | Time per read | Reads per second |");
-    println!("|---|---|---|");
-    let d = per_op(n, || {
-        for &i in &order {
-            assert!(kdb.get("kv", &key(i)).unwrap().is_some());
-        }
-    });
-    row("KvSQL `Db::get`", d);
-    let d = per_op(n, || {
-        for &i in &order {
-            let tx = rdb.begin_read().unwrap();
-            let table = tx.open_table(KV).unwrap();
-            assert!(table.get(&key(i)[..]).unwrap().is_some());
-        }
-    });
-    row("redb `begin_read`, `open_table`, `get`", d);
-    let d = per_op(n, || {
-        for &i in &order {
-            assert!(fks.get(key(i)).unwrap().is_some());
-        }
-    });
-    row("fjall `Keyspace::get`", d);
-    let d = per_op(n, || {
-        let mut st = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
-        for &i in &order {
-            let v: Vec<u8> = st.query_row([key(i).to_vec()], |r| r.get(0)).unwrap();
-            assert!(!v.is_empty());
-        }
-    });
-    row("SQLite prepared `SELECT v FROM kv WHERE k = ?`", d);
-    println!();
+    table(
+        "read",
+        vec![
+            case("KvSQL `Db::get`", n, || {
+                for &i in &order {
+                    assert_eq!(kdb.get("kv", &key(i)).unwrap().unwrap(), values[i]);
+                }
+            }),
+            case("redb `begin_read`, `open_table`, `get`", n, || {
+                for &i in &order {
+                    let tx = rdb.begin_read().unwrap();
+                    let table = tx.open_table(KV).unwrap();
+                    assert_eq!(
+                        table.get(&key(i)[..]).unwrap().unwrap().value(),
+                        &values[i][..]
+                    );
+                }
+            }),
+            case("fjall `Keyspace::get`", n, || {
+                for &i in &order {
+                    assert_eq!(&*fks.get(key(i)).unwrap().unwrap(), &values[i][..]);
+                }
+            }),
+            case("SQLite prepared `SELECT v FROM kv WHERE k = ?`", n, || {
+                let mut st = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
+                for &i in &order {
+                    let v: Vec<u8> = st.query_row([key(i).to_vec()], |r| r.get(0)).unwrap();
+                    assert_eq!(v, values[i]);
+                }
+            }),
+        ],
+    );
 
-    println!("## Key get inside one open read transaction\n");
-    println!("All reads of a round go through one read transaction, so the per-call snapshot cost is left out. fjall and SQLite are not in this table: fjall's `Keyspace::get` has no cheaper form, and SQLite's is the row above.\n");
-    println!("| Store and call | Time per read | Reads per second |");
-    println!("|---|---|---|");
-    let d = per_op(n, || {
-        let mut tx = kdb.begin_read().unwrap();
-        for &i in &order {
-            assert!(tx.get("kv", &key(i)).unwrap().is_some());
-        }
-    });
-    row("KvSQL `ReadTx::get`", d);
-    let d = per_op(n, || {
-        let tx = rdb.begin_read().unwrap();
-        let table = tx.open_table(KV).unwrap();
-        for &i in &order {
-            assert!(table.get(&key(i)[..]).unwrap().is_some());
-        }
-    });
-    row("redb `ReadOnlyTable::get`", d);
-    println!();
+    println!("## Key get inside one open snapshot\n");
+    println!("All reads of a round go through one read transaction or snapshot, so the per-call snapshot cost is left out. SQLite is not in this table; its row above already reuses one prepared statement.\n");
+    table(
+        "read",
+        vec![
+            case("KvSQL `ReadTx::get`", n, || {
+                let mut tx = kdb.begin_read().unwrap();
+                for &i in &order {
+                    assert_eq!(tx.get("kv", &key(i)).unwrap().unwrap(), values[i]);
+                }
+            }),
+            case("redb `ReadOnlyTable::get`", n, || {
+                let tx = rdb.begin_read().unwrap();
+                let table = tx.open_table(KV).unwrap();
+                for &i in &order {
+                    assert_eq!(
+                        table.get(&key(i)[..]).unwrap().unwrap().value(),
+                        &values[i][..]
+                    );
+                }
+            }),
+            case("fjall `Snapshot::get`", n, || {
+                let snap = fdb.snapshot();
+                for &i in &order {
+                    assert_eq!(&*snap.get(&fks, key(i)).unwrap().unwrap(), &values[i][..]);
+                }
+            }),
+        ],
+    );
 
     // --------------------------------------------------------------- scans
     println!("## Range scan of {SCAN_LEN} consecutive keys\n");
-    println!("| Store and call | Time per scan | Scans per second |");
-    println!("|---|---|---|");
-    let d = per_op(starts.len(), || {
-        for &s in &starts {
-            let items = kdb.scan("kv", &key(s), None, SCAN_LEN).unwrap();
-            assert_eq!(items.len(), SCAN_LEN);
-        }
-    });
-    row("KvSQL `Db::scan`", d);
-    let d = per_op(starts.len(), || {
-        for &s in &starts {
-            let tx = rdb.begin_read().unwrap();
-            let table = tx.open_table(KV).unwrap();
-            let lo = key(s);
-            let mut c = 0;
-            for item in table.range(&lo[..]..).unwrap().take(SCAN_LEN) {
-                let (k, v) = item.unwrap();
-                assert!(!k.value().is_empty() && !v.value().is_empty());
-                c += 1;
-            }
-            assert_eq!(c, SCAN_LEN);
-        }
-    });
-    row("redb `range`, read transaction per scan", d);
-    let d = per_op(starts.len(), || {
-        for &s in &starts {
-            let mut c = 0;
-            for item in fks.range(key(s)..).take(SCAN_LEN) {
-                let (k, v) = item.into_inner().unwrap();
-                assert!(!k.is_empty() && !v.is_empty());
-                c += 1;
-            }
-            assert_eq!(c, SCAN_LEN);
-        }
-    });
-    row("fjall `Keyspace::range`", d);
-    let d = per_op(starts.len(), || {
-        let mut st = conn
-            .prepare_cached("SELECT k, v FROM kv WHERE k >= ? ORDER BY k LIMIT ?")
-            .unwrap();
-        for &s in &starts {
-            let c = st
-                .query_map(params![key(s).to_vec(), SCAN_LEN as i64], |r| {
-                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
-                })
-                .unwrap()
-                .inspect(|r| assert!(r.is_ok()))
-                .count();
-            assert_eq!(c, SCAN_LEN);
-        }
-    });
-    row("SQLite prepared `WHERE k >= ? ORDER BY k LIMIT ?`", d);
-    println!();
+    table(
+        "scan",
+        vec![
+            case("KvSQL `Db::scan`", starts.len(), || {
+                for &s in &starts {
+                    let items = kdb.scan("kv", &key(s), None, SCAN_LEN).unwrap();
+                    assert_eq!(items.len(), SCAN_LEN);
+                    assert_eq!(items[0].0, key(s));
+                    assert_eq!(items[SCAN_LEN - 1].1, values[s + SCAN_LEN - 1]);
+                }
+            }),
+            case(
+                "redb `range`, read transaction per scan",
+                starts.len(),
+                || {
+                    for &s in &starts {
+                        let tx = rdb.begin_read().unwrap();
+                        let table = tx.open_table(KV).unwrap();
+                        let lo = key(s);
+                        let mut c = 0;
+                        for item in table.range(&lo[..]..).unwrap().take(SCAN_LEN) {
+                            let (k, v) = item.unwrap();
+                            assert_eq!(k.value(), &key(s + c)[..]);
+                            assert!(!v.value().is_empty());
+                            c += 1;
+                        }
+                        assert_eq!(c, SCAN_LEN);
+                    }
+                },
+            ),
+            case("fjall `Keyspace::range`", starts.len(), || {
+                for &s in &starts {
+                    let mut c = 0;
+                    for item in fks.range(key(s)..).take(SCAN_LEN) {
+                        let (k, v) = item.into_inner().unwrap();
+                        assert_eq!(&*k, &key(s + c)[..]);
+                        assert!(!v.is_empty());
+                        c += 1;
+                    }
+                    assert_eq!(c, SCAN_LEN);
+                }
+            }),
+            case(
+                "SQLite prepared `WHERE k >= ? ORDER BY k LIMIT ?`",
+                starts.len(),
+                || {
+                    let mut st = conn
+                        .prepare_cached("SELECT k, v FROM kv WHERE k >= ? ORDER BY k LIMIT ?")
+                        .unwrap();
+                    for &s in &starts {
+                        let mut c = 0;
+                        let rows = st
+                            .query_map(params![key(s).to_vec(), SCAN_LEN as i64], |r| {
+                                Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                            })
+                            .unwrap();
+                        for r in rows {
+                            let (k, v) = r.unwrap();
+                            assert_eq!(k, key(s + c));
+                            assert!(!v.is_empty());
+                            c += 1;
+                        }
+                        assert_eq!(c, SCAN_LEN);
+                    }
+                },
+            ),
+        ],
+    );
 
     // ----------------------------------------------------------- SQL point
     println!("## Point select by primary key through SQL\n");
-    println!("`SELECT name FROM t WHERE id = ?` with the id as a parameter. KvSQL and GlueSQL parse the text on every call (KvSQL keeps a parsed-statement cache; GlueSQL has no prepared statements). SQLite is shown prepared once and parsing every time. GlueSQL reads the first {} keys of the shuffled order each round, the others every key.\n", glue_order.len());
-    println!("| Store and call | Time per select | Selects per second |");
-    println!("|---|---|---|");
-    let d = per_op(n, || {
-        for &i in &order {
-            let r = kdb
-                .execute("SELECT name FROM t WHERE id = ?", &[Value::Int(i as i64)])
-                .unwrap();
-            assert_eq!(r.rows.len(), 1);
-        }
-    });
-    row("KvSQL `Db::execute`", d);
-    let k_sql = d;
-    let d = per_op(glue_order.len(), || {
-        for &i in &glue_order {
-            let rows = glue_rows(
-                glue.execute_with_params("SELECT name FROM t WHERE id = $1", [i as i64])
-                    .unwrap(),
-            );
-            assert_eq!(rows.len(), 1);
-        }
-    });
-    row("GlueSQL `Glue::execute_with_params`", d);
-    let g_sql = d;
-    let d = per_op(n, || {
-        let mut st = conn
-            .prepare_cached("SELECT name FROM t WHERE id = ?")
-            .unwrap();
-        for &i in &order {
-            let _: String = st.query_row([i as i64], |r| r.get(0)).unwrap();
-        }
-    });
-    row("SQLite, prepared once", d);
-    let s_prep = d;
-    let d = per_op(n, || {
-        for &i in &order {
-            let mut st = conn.prepare("SELECT name FROM t WHERE id = ?").unwrap();
-            let _: String = st.query_row([i as i64], |r| r.get(0)).unwrap();
-        }
-    });
-    row("SQLite, parsed every call", d);
-    println!();
-    let k_row = per_op(n, || {
-        for &i in &order {
-            assert!(kdb.get_row("t", &Value::Int(i as i64)).unwrap().is_some());
-        }
-    });
-    println!(
-        "The same row through KvSQL's key door (`Db::get_row`): {} per read.\n",
-        fmt(k_row)
+    println!("`SELECT name FROM t WHERE id = ?` with the id as a parameter, and the name checked. KvSQL and GlueSQL parse the text on every call (KvSQL keeps a parsed-statement cache; GlueSQL has no prepared statements). GlueSQL runs each round's selects inside one `BEGIN` ... `COMMIT`: on its redb storage an autocommit statement, a SELECT included, opens and commits a redb write transaction and so syncs to disk. That autocommit form is shown on its own row, over {} keys per round. SQLite is shown prepared once and parsing every time. The last row reads the same row through KvSQL's key door.\n", auto_order.len());
+    table(
+        "select",
+        vec![
+            case("KvSQL `Db::execute`", n, || {
+                for &i in &order {
+                    let r = kdb
+                        .execute("SELECT name FROM t WHERE id = ?", &[Value::Int(i as i64)])
+                        .unwrap();
+                    assert_eq!(r.rows, vec![vec![Value::Text(names[i].clone())]]);
+                }
+            }),
+            case(
+                "GlueSQL `execute_with_params` inside one transaction",
+                n,
+                || {
+                    let mut g = glue.borrow_mut();
+                    g.execute("BEGIN").unwrap();
+                    for &i in &order {
+                        let rows = glue_rows(
+                            g.execute_with_params("SELECT name FROM t WHERE id = $1", [i as i64])
+                                .unwrap(),
+                        );
+                        assert_eq!(rows, vec![vec![GValue::Str(names[i].clone())]]);
+                    }
+                    g.execute("COMMIT").unwrap();
+                },
+            ),
+            case(
+                "GlueSQL `execute_with_params`, autocommit (syncs per statement)",
+                auto_order.len(),
+                || {
+                    let mut g = glue.borrow_mut();
+                    for &i in &auto_order {
+                        let rows = glue_rows(
+                            g.execute_with_params("SELECT name FROM t WHERE id = $1", [i as i64])
+                                .unwrap(),
+                        );
+                        assert_eq!(rows.len(), 1);
+                    }
+                },
+            ),
+            case("SQLite, prepared once", n, || {
+                let mut st = conn
+                    .prepare_cached("SELECT name FROM t WHERE id = ?")
+                    .unwrap();
+                for &i in &order {
+                    let v: String = st.query_row([i as i64], |r| r.get(0)).unwrap();
+                    assert_eq!(v, names[i]);
+                }
+            }),
+            case("SQLite, parsed every call", n, || {
+                for &i in &order {
+                    let mut st = conn.prepare("SELECT name FROM t WHERE id = ?").unwrap();
+                    let v: String = st.query_row([i as i64], |r| r.get(0)).unwrap();
+                    assert_eq!(v, names[i]);
+                }
+            }),
+            case("KvSQL `Db::get_row` (key door, no SQL)", n, || {
+                for &i in &order {
+                    let r = kdb.get_row("t", &Value::Int(i as i64)).unwrap().unwrap();
+                    assert_eq!(r[1], Value::Text(names[i].clone()));
+                }
+            }),
+        ],
     );
 
     // ------------------------------------------------------ synced commits
     println!("## One small write per transaction, synced on every commit\n");
-    println!("| Store and call | Time per commit | Commits per second |");
-    println!("|---|---|---|");
-    let mut next = n;
-    let d = per_op(commits, || {
-        for _ in 0..commits {
-            kdb.put("kv", &key(next), b"fresh value!!").unwrap();
-            next += 1;
-        }
-    });
-    row("KvSQL `Db::put`", d);
-    let mut next = n;
-    let d = per_op(commits, || {
-        for _ in 0..commits {
-            let mut tx = rdb.begin_write().unwrap();
-            tx.set_durability(redb::Durability::Immediate).unwrap();
-            {
-                let mut table = tx.open_table(KV).unwrap();
-                table.insert(&key(next)[..], &b"fresh value!!"[..]).unwrap();
-            }
-            tx.commit().unwrap();
-            next += 1;
-        }
-    });
-    row("redb write transaction, `Durability::Immediate`", d);
-    let mut next = n;
-    let d = per_op(commits, || {
-        for _ in 0..commits {
-            fks.insert(key(next), b"fresh value!!").unwrap();
-            fdb.persist(fjall::PersistMode::SyncData).unwrap();
-            next += 1;
-        }
-    });
-    row("fjall `insert` then `persist(SyncData)`", d);
-    let mut next = n;
-    let d = per_op(commits, || {
-        for _ in 0..commits {
-            glue.execute_with_params(
-                "INSERT INTO t VALUES ($1, 'fresh value!', 1)",
-                [next as i64],
-            )
-            .unwrap();
-            next += 1;
-        }
-    });
-    row("GlueSQL `INSERT INTO t`, autocommit", d);
-    let mut next = n;
-    let d = per_op(commits, || {
-        let mut st = conn.prepare_cached("INSERT INTO kv VALUES (?, ?)").unwrap();
-        for _ in 0..commits {
-            st.execute(params![key(next).to_vec(), b"fresh value!!".to_vec()])
-                .unwrap();
-            next += 1;
-        }
-    });
-    row("SQLite prepared `INSERT INTO kv`, autocommit", d);
-    println!();
+    let (mut kn, mut rn, mut fnx, mut gn, mut sn) = (n, n, n, n, n);
+    table(
+        "commit",
+        vec![
+            case("KvSQL `Db::put`", commits, || {
+                for _ in 0..commits {
+                    kdb.put("kv", &key(kn), b"fresh value!!").unwrap();
+                    kn += 1;
+                }
+            }),
+            case(
+                "redb write transaction, `Durability::Immediate`",
+                commits,
+                || {
+                    for _ in 0..commits {
+                        let mut tx = rdb.begin_write().unwrap();
+                        tx.set_durability(redb::Durability::Immediate).unwrap();
+                        {
+                            let mut table = tx.open_table(KV).unwrap();
+                            table.insert(&key(rn)[..], &b"fresh value!!"[..]).unwrap();
+                        }
+                        tx.commit().unwrap();
+                        rn += 1;
+                    }
+                },
+            ),
+            case("fjall `insert` then `persist(SyncData)`", commits, || {
+                for _ in 0..commits {
+                    fks.insert(key(fnx), b"fresh value!!").unwrap();
+                    fdb.persist(fjall::PersistMode::SyncData).unwrap();
+                    fnx += 1;
+                }
+            }),
+            case("GlueSQL `INSERT INTO t`, autocommit", commits, || {
+                let mut g = glue.borrow_mut();
+                for _ in 0..commits {
+                    g.execute_with_params(
+                        "INSERT INTO t VALUES ($1, 'fresh value!', 1)",
+                        [gn as i64],
+                    )
+                    .unwrap();
+                    gn += 1;
+                }
+            }),
+            case(
+                "SQLite prepared `INSERT INTO kv`, autocommit",
+                commits,
+                || {
+                    let mut st = conn.prepare_cached("INSERT INTO kv VALUES (?, ?)").unwrap();
+                    for _ in 0..commits {
+                        st.execute(params![key(sn).to_vec(), b"fresh value!!".to_vec()])
+                            .unwrap();
+                        sn += 1;
+                    }
+                },
+            ),
+        ],
+    );
 
     // ------------------------------------------------------- load and size
     drop(kdb);
@@ -547,7 +651,8 @@ fn main() {
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     drop(conn);
     println!("## Bulk load in one transaction, and size on disk\n");
-    println!("Size is measured after every write above, with each store closed (fjall: its whole folder; SQLite: the database file and its WAL). File length is what a directory listing shows; allocated is what the file system holds for it (fjall preallocates its journal to 64 MiB as a sparse file).\n");
+    println!("Loads are timed once, before the tables above. KvSQL, redb, fjall and SQLite load through their APIs one key or row at a time; GlueSQL takes {} `INSERT` statements of up to 1000 rows each in one transaction. fjall's load is one write batch and a sync; flushing it to on-disk tables and compacting them took {} more.\n", n.div_ceil(1000), fmt(f_flush));
+    println!("Sizes are read after every write above, with each store closed (fjall: its whole folder; SQLite: the database file and its WAL). File length is what a directory listing shows; allocated is what the file system holds (fjall preallocates its journal to 64 MiB as a sparse file). The stores hold different things, so sizes can't be compared across rows: KvSQL and SQLite hold the keys, the table and space left by about a thousand commits; redb and fjall hold only the keys; GlueSQL only the table.\n");
     println!("| Store | Load {n} keys | Load {n} table rows | File length | Allocated |");
     println!("|---|---|---|---|---|");
     println!(
@@ -562,12 +667,12 @@ fn main() {
         sizes(disk_size(&rpath))
     );
     println!(
-        "| fjall | {} (one batch, then a sync) | | {} |",
+        "| fjall | {} | | {} |",
         fmt(f_load),
         sizes(disk_size(&fpath))
     );
     println!(
-        "| GlueSQL | | {} (INSERTs of 1000 rows in one transaction) | {} |",
+        "| GlueSQL | | {} | {} |",
         fmt(g_load),
         sizes(disk_size(&gpath))
     );
@@ -577,13 +682,4 @@ fn main() {
         fmt(s_load_rows),
         sizes(sqlite_size(&spath))
     );
-    println!("\nKvSQL and SQLite hold both the keys and the table in one file; redb and fjall hold only the keys; GlueSQL holds only the table.\n");
-
-    println!("## Ratios\n");
-    println!(
-        "- KvSQL SQL point select against GlueSQL: {:.1}x the speed; against SQLite prepared: {:.2}x. A figure above 1x means KvSQL is faster.",
-        g_sql.as_nanos() as f64 / k_sql.as_nanos() as f64,
-        s_prep.as_nanos() as f64 / k_sql.as_nanos() as f64
-    );
-    let _ = std::fs::remove_dir_all(&dir);
 }
