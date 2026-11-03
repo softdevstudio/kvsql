@@ -19,7 +19,7 @@ kvsqld --db PATH [--listen ADDR] [--token TOKEN] [--max-connections N]
 On start it prints one line to standard output, for example
 
 ```
-kvsqld 0.1.0 listening on 127.0.0.1:7878, database app.db
+kvsqld 0.2.0 listening on 127.0.0.1:7878, database app.db
 ```
 
 Scripts can read the address from that line. With no token and an address beyond localhost it prints a warning on standard error. The server holds the file lock, so other processes cannot open the file while it runs.
@@ -54,7 +54,7 @@ Keys and values in KV listings use a string when the bytes are valid UTF-8 and t
 
 | Method and path | Does |
 |---|---|
-| `GET /health` | `{"status":"ok","version":"0.1.0","txid":N}` |
+| `GET /health` | `{"status":"ok","version":"0.2.0","txid":N}` |
 | `GET /verify` | Runs `Db::verify` over the whole file. `{"ok":true,"txid":..,"pages":..,"free_pages":..,"keyspaces":..,"keys":..}` |
 | `GET /kv` | `{"keyspaces":[...]}` |
 | `GET /kv/{ks}?from=&to=&limit=` | Keys in order from `from` (inclusive) up to `to` (exclusive). Default limit 1000. `{"items":[{"key":..,"value":..}]}` |

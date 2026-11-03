@@ -9,7 +9,7 @@ There are two products:
 
 Status: 0.2.0. The storage engine, key-value API, snapshot readers, SQL with prepared statements, the server and the shell work and are tested. A commit syncs to disk once. The file format may still change before 1.0.
 
-Upgrading from 0.1: 0.2 opens 0.1 files and moves them to file format version 2 at their first commit. After that, 0.1 can't open them, so keep a copy if you might go back.
+Upgrading from 0.1: 0.2 opens 0.1 files and moves them to file format version 2 at their first commit. After that, 0.1 can't open them, so keep a copy if you might go back. (If that first commit is cut short by a crash after it lands, 0.1 may still open the older state until the next 0.2 commit.)
 
 ## Download
 

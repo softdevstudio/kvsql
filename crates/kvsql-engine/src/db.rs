@@ -1554,10 +1554,13 @@ impl WriteTx<'_> {
             // The first commit on a version 1 file leaves the version 1 meta
             // page of the commit before in the other slot. KvSQL 0.1 would
             // open that and quietly lose this commit, so clear it. This
-            // commit is durable already and needs no fallback.
+            // commit is durable already and needs no fallback, so a failure
+            // here does not fail the commit; the next commit overwrites
+            // that slot anyway.
             if self.base.version == 1 {
-                store.write_at((1 - slot) * PAGE_SIZE as u64, &vec![0u8; PAGE_SIZE])?;
-                store.sync()?;
+                let _ = store
+                    .write_at((1 - slot) * PAGE_SIZE as u64, &vec![0u8; PAGE_SIZE])
+                    .and_then(|_| store.sync());
             }
             Ok(())
         })();

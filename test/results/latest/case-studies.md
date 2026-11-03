@@ -1,33 +1,33 @@
 # KvSQL case studies and use examples
 
 - Host: linux x86_64, Intel(R) Xeon(R) Processor @ 2.10GHz, 2 hardware threads
-- KvSQL 0.1.0, release build, one run
+- KvSQL 0.2.0, release build, one run
 - Sessions and gateway: real files in the temp directory, every commit synced. Checkout: the simulated disk used by the power-cut tests
 
 ## Case study: sessions and reporting in one store
 
-- 100000 sessions for 20,000 users, written in one transaction with `put_row`: 755.0 ms
-- 200000 random token lookups with `get_row`: 1.55 µs each, all found
-- The same lookups through `SELECT user_id FROM sessions WHERE token = ?`: 3.16 µs each
-- Dashboard query, live sessions per country over all 100000 rows: 27.1 ms (49586 live, 8 countries)
+- 100000 sessions for 20,000 users, written in one transaction with `put_row`: 663.6 ms
+- 200000 random token lookups with `get_row`: 1.60 µs each, all found
+- The same lookups through `SELECT user_id FROM sessions WHERE token = ?`: 2.67 µs each
+- Dashboard query, live sessions per country over all 100000 rows: 29.0 ms (49586 live, 8 countries)
 - Revoking user 4242: 5 sessions before, 5 deleted through the index in 2.5 ms including the synced commit, 0 left; a reader opened before the delete still counted 5; `get_row` on one of the revoked tokens then found nothing
-- `verify` afterwards: 3747 pages, 199992 keys, every index entry matches its row
+- `verify` afterwards: 3760 pages, 199992 keys, every index entry matches its row
 
 ## Case study: an edge gateway with kvsqld
 
-- 20 devices on their own connections sent 10000 readings, one request each, every request a synced transaction holding the history row and the latest value: 7.2 s, about 1386 requests a second
-- 2000 dashboard reads of `GET /rows/latest/dev-NN` over HTTP: 50.89 µs each, round trip included (last answer `{"row":["dev-19",1800014970,23.8]}`)
-- Per-device summary over all 10000 readings, top three by peak: 3.1 ms, answer `[["dev-07",500,22.83,34.9],["dev-00",500,22.03,25.9],["dev-01",500,22.01,25.9]]`
-- Alert query, readings over 30 °C: 2.4 ms, answer `[["dev-07",40,1800006000,1800007170]]` (device, count, first and last timestamp)
-- One device's history through the index: 0.6 ms, answer `[[500,22.83]]`
-- `GET /verify` afterwards: `{"ok":true,"txid":10001,"pages":326,"free_pages":7,"keyspaces":4,"keys":20023}`
+- 20 devices on their own connections sent 10000 readings, one request each, every request a synced transaction holding the history row and the latest value: 4.5 s, about 2242 requests a second
+- 2000 dashboard reads of `GET /rows/latest/dev-NN` over HTTP: 51.99 µs each, round trip included (last answer `{"row":["dev-19",1800014970,23.8]}`)
+- Per-device summary over all 10000 readings, top three by peak: 3.4 ms, answer `[["dev-07",500,22.83,34.9],["dev-00",500,22.03,25.9],["dev-01",500,22.01,25.9]]`
+- Alert query, readings over 30 °C: 2.6 ms, answer `[["dev-07",40,1800006000,1800007170]]` (device, count, first and last timestamp)
+- One device's history through the index: 0.5 ms, answer `[[500,22.83]]`
+- `GET /verify` afterwards: `{"ok":true,"txid":10001,"pages":334,"free_pages":8,"keyspaces":4,"keys":20023}`
 
 ## Case study: a checkout that is never half done
 
-- The checkout reads the cart by key, inserts the order and three order lines and takes the stock through SQL, reads each price by key, and deletes the cart by key, all in one transaction. Its commit is 3 writes and 2 syncs on the simulated disk
+- The checkout reads the cart by key, inserts the order and three order lines and takes the stock through SQL, reads each price by key, and deletes the cart by key, all in one transaction. Its commit is 3 writes and 1 syncs on the simulated disk
 - Before: cart `kettlex1,mugx4,teapotx1`, stock [12, 40, 5, 9]. After: no cart, stock [11, 36, 4, 9], order 5001 total 9700 cents
-- Power cut after each of the 5 steps and after none, each cut replayed 200 ways (every unsynced write kept, none kept, any subset, subsets with torn sectors): 1200 reopened files
-- Every one passed `verify` and held either the shop before the checkout (794) or after it (406). None held an order without its stock taken, or a cart still there beside its order
+- Power cut after each of the 4 steps and after none, each cut replayed 200 ways (every unsynced write kept, none kept, any subset, subsets with torn sectors): 1000 reopened files
+- Every one passed `verify` and held either the shop before the checkout (686) or after it (314). None held an order without its stock taken, or a cart still there beside its order
 
 ## Use example: a cache with expiry
 
@@ -57,6 +57,6 @@ ok
 kvsql> .get notes deploy
 shipped 0.1.0
 kvsql> .verify
-ok: commit 3, 9 pages (2 free), 3 keyspaces, 5 keys
+ok: commit 3, 11 pages (3 free), 3 keyspaces, 5 keys
 ```
 
