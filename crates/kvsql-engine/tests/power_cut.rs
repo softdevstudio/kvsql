@@ -232,3 +232,52 @@ fn power_cut_during_sql_keeps_indexes_exact() {
     eprintln!("sql_power_cut: {rounds} statements, {cut} cut mid-commit, {landed} landed whole, {lost} rolled back or failed");
     assert!(cut > 0 && landed > 0);
 }
+
+/// A process killed during a commit leaves that commit's writes in the OS
+/// page cache, readable but not durable. Reopening must not build on them
+/// as if they were on disk: if the next commit is then cut short by a power
+/// failure, every commit that returned before the kill must still be there.
+#[test]
+fn kill_then_reopen_then_power_cut_keeps_returned_commits() {
+    let seed = seed("kill_then_reopen");
+    let rounds = env_u64("KVSQL_POWER_CUTS", 2000) / 4;
+    let mut rng = Rng::new(seed);
+    for round in 0..rounds.max(50) {
+        let ctx = format!("seed {seed} round {round}");
+        let storage = SimStorage::new();
+        let db = Db::open_with(Box::new(storage.clone()), Options { cache_pages: 64 }).unwrap();
+        // Commits that return; the last one's value must survive.
+        let mut last = Vec::new();
+        for _ in 0..1 + rng.below(5) {
+            let n = 1 + rng.below(300) as usize;
+            last = rng.bytes(n);
+            db.put("k", b"returned", &last).unwrap();
+            let k = rng.bytes(4);
+            db.put("j", &k, b"x").unwrap();
+        }
+        // The process dies somewhere inside the next commit.
+        storage.fail_after(rng.below(10));
+        let _ = db.put("k", b"returned", b"in flight 1");
+        drop(db);
+        storage.revive();
+        // Reopen on the same machine; the next commit is cut short by a
+        // power failure.
+        let db = Db::open_with(Box::new(storage.clone()), Options { cache_pages: 64 })
+            .unwrap_or_else(|e| panic!("{ctx}: reopen after kill: {e}"));
+        storage.fail_after(rng.below(10));
+        let _ = db.put("k", b"returned", b"in flight 2");
+        drop(db);
+        let image = storage.crash_image(&mut rng);
+        let db = Db::open_with(Box::new(SimStorage::from_image(image)), Options::default())
+            .unwrap_or_else(|e| panic!("{ctx}: open after power cut: {e}"));
+        db.verify()
+            .unwrap_or_else(|e| panic!("{ctx}: verify after power cut: {e}"));
+        let got = db.get("k", b"returned").unwrap();
+        assert!(
+            got.as_deref() == Some(&last[..])
+                || got.as_deref() == Some(b"in flight 1")
+                || got.as_deref() == Some(b"in flight 2"),
+            "{ctx}: the last returned commit was lost: got {got:?}"
+        );
+    }
+}

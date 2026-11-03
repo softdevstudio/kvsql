@@ -84,6 +84,15 @@ impl SimStorage {
         self.state.lock().unwrap().ops_left = Some(n);
     }
 
+    /// The process died but the machine did not: unsynced writes stay where
+    /// a reopened file can read them (the OS page cache) without being
+    /// durable yet. The disk takes writes and syncs again.
+    pub fn revive(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.dead = false;
+        st.ops_left = None;
+    }
+
     pub fn is_dead(&self) -> bool {
         self.state.lock().unwrap().dead
     }

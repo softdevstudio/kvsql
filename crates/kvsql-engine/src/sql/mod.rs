@@ -200,6 +200,8 @@ pub(crate) fn query_prepared<K: Kv>(
         return query(kv, p, params);
     };
     check_params(p, params)?;
+    // One plan per statement: snapshots at different schema generations
+    // replace each other's plan, which costs a compile, never a wrong answer.
     let cached = lock(&st.plan)
         .as_ref()
         .filter(|(at, _)| *at == g)

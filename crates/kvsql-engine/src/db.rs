@@ -67,6 +67,8 @@ struct Meta {
     rec_count: u64,
     /// CRC-32C over every record entry in order.
     rec_crc: u32,
+    /// The format version the page was read with (1 or 2); new pages are 2.
+    version: u32,
 }
 
 impl Meta {
@@ -108,6 +110,7 @@ impl Meta {
             rec_head: if v2 { get_u64(p, HEADER + 56) } else { 0 },
             rec_count: if v2 { get_u64(p, HEADER + 64) } else { 0 },
             rec_crc: if v2 { get_u32(p, HEADER + 72) } else { 0 },
+            version,
         };
         // In version 2 every commit after the first meta page has a record.
         let sane = m.page_count >= 2
@@ -497,6 +500,7 @@ impl Db {
                     rec_head: 0,
                     rec_count: 0,
                     rec_crc: 0,
+                    version: FORMAT_VERSION,
                 };
                 let first = m.encode(0);
                 let mut have = vec![0u8; len as usize];
@@ -517,6 +521,11 @@ impl Db {
                 return corrupt("no valid meta page; not a KvSQL database file, or a damaged one")
             }
         };
+        // A process killed inside a commit can leave that commit's writes in
+        // the OS page cache, where the check above reads them but a power
+        // failure would not keep them. Make whatever was read durable now,
+        // before the next commit reuses pages the previous commits need.
+        store.sync()?;
         let shared = Shared {
             store,
             cache: Cache::new(opts.cache_pages),
@@ -1510,6 +1519,7 @@ impl WriteTx<'_> {
             rec_head: rec_pages[0],
             rec_count: entries.len() as u64,
             rec_crc: crate::crc32::crc32c(&rec_crc_input),
+            version: FORMAT_VERSION,
         };
         let store = &self.shared.store;
         let result = (|| -> Result<()> {
@@ -1541,6 +1551,14 @@ impl WriteTx<'_> {
             let slot = meta.txid % 2;
             store.write_at(slot * PAGE_SIZE as u64, &meta.encode(slot))?;
             store.sync()?;
+            // The first commit on a version 1 file leaves the version 1 meta
+            // page of the commit before in the other slot. KvSQL 0.1 would
+            // open that and quietly lose this commit, so clear it. This
+            // commit is durable already and needs no fallback.
+            if self.base.version == 1 {
+                store.write_at((1 - slot) * PAGE_SIZE as u64, &vec![0u8; PAGE_SIZE])?;
+                store.sync()?;
+            }
             Ok(())
         })();
         if let Err(e) = result {

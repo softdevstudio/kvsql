@@ -35,7 +35,11 @@ Pages 0 and 1. Transaction N writes its meta page into slot N mod 2, so the prev
 
 On open, meta pages are tried newest transaction first. A version 1 meta page, and the empty file's first meta page (transaction 0, no record), are accepted as they are. A version 2 meta page is accepted only if its commit record checks out: every record page is sealed, has type 6 and carries this transaction id, the entries add up to the count and CRC in the meta page, and every page the record lists reads back sealed with the listed CRC. Otherwise the other meta page is tried.
 
-A version 1 file is read as it is and becomes version 2 at its first commit. KvSQL 0.1 refuses a version 2 file.
+Opening then syncs the file. A process killed inside a commit can leave that commit's writes in the operating system's cache, where the check reads them but a power failure would lose them; the sync makes what open accepted durable before the next commit reuses pages the earlier commits need.
+
+Checking a record reads every page that commit wrote, so opening a file whose last commit was a large bulk load reads that much again.
+
+A version 1 file is read as it is and becomes version 2 at its first commit. That commit also clears the other meta slot, which still held a version 1 meta page, so KvSQL 0.1 refuses the file ("no valid meta page") instead of opening the state before that commit.
 
 ## Commit order
 

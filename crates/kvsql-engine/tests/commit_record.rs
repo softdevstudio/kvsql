@@ -224,6 +224,12 @@ fn a_version_1_file_from_0_1_opens_and_upgrades() {
         .unwrap();
     drop(db);
     assert_eq!(newest_meta(&path).1, 2, "the first commit writes version 2");
+    // No version 1 meta page is left for KvSQL 0.1 to open in its place.
+    for slot in 0..2 {
+        let p = read_page(&path, slot);
+        let is_v1 = &p[HEADER..HEADER + 8] == b"KVSQLDB\0" && u32_at(&p, HEADER + 8) == 1;
+        assert!(!is_v1, "slot {slot} still holds a version 1 meta page");
+    }
     let db = Db::open(&path).unwrap();
     db.verify().unwrap();
     assert_eq!(rows(&db), want(true));
