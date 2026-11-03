@@ -1,26 +1,26 @@
 # KvSQL case studies and use examples
 
-- Host: linux x86_64, Intel(R) Xeon(R) Processor @ 2.80GHz, 2 hardware threads
+- Host: linux x86_64, Intel(R) Xeon(R) Processor @ 2.10GHz, 2 hardware threads
 - KvSQL 0.1.0, release build, one run
 - Sessions and gateway: real files in the temp directory, every commit synced. Checkout: the simulated disk used by the power-cut tests
 
 ## Case study: sessions and reporting in one store
 
-- 100000 sessions for 20,000 users, written in one transaction with `put_row`: 964.3 ms
-- 200000 random token lookups with `get_row`: 2.00 µs each, all found
-- The same lookups through `SELECT user_id FROM sessions WHERE token = ?`: 4.10 µs each
-- Dashboard query, live sessions per country over all 100000 rows: 53.5 ms (49586 live, 8 countries)
-- Revoking user 4242: 5 sessions before, 5 deleted through the index in 1.7 ms including the synced commit, 0 left; a reader opened before the delete still counted 5; `get_row` on one of the revoked tokens then found nothing
+- 100000 sessions for 20,000 users, written in one transaction with `put_row`: 755.0 ms
+- 200000 random token lookups with `get_row`: 1.55 µs each, all found
+- The same lookups through `SELECT user_id FROM sessions WHERE token = ?`: 3.16 µs each
+- Dashboard query, live sessions per country over all 100000 rows: 27.1 ms (49586 live, 8 countries)
+- Revoking user 4242: 5 sessions before, 5 deleted through the index in 2.5 ms including the synced commit, 0 left; a reader opened before the delete still counted 5; `get_row` on one of the revoked tokens then found nothing
 - `verify` afterwards: 3747 pages, 199992 keys, every index entry matches its row
 
 ## Case study: an edge gateway with kvsqld
 
-- 20 devices on their own connections sent 10000 readings, one request each, every request a synced transaction holding the history row and the latest value: 8.1 s, about 1236 requests a second
-- 2000 dashboard reads of `GET /rows/latest/dev-NN` over HTTP: 71.40 µs each, round trip included (last answer `{"row":["dev-19",1800014970,23.8]}`)
-- Per-device summary over all 10000 readings, top three by peak: 5.0 ms, answer `[["dev-07",500,22.83,34.9],["dev-00",500,22.03,25.9],["dev-01",500,22.01,25.9]]`
-- Alert query, readings over 30 °C: 3.4 ms, answer `[["dev-07",40,1800006000,1800007170]]` (device, count, first and last timestamp)
+- 20 devices on their own connections sent 10000 readings, one request each, every request a synced transaction holding the history row and the latest value: 7.2 s, about 1386 requests a second
+- 2000 dashboard reads of `GET /rows/latest/dev-NN` over HTTP: 50.89 µs each, round trip included (last answer `{"row":["dev-19",1800014970,23.8]}`)
+- Per-device summary over all 10000 readings, top three by peak: 3.1 ms, answer `[["dev-07",500,22.83,34.9],["dev-00",500,22.03,25.9],["dev-01",500,22.01,25.9]]`
+- Alert query, readings over 30 °C: 2.4 ms, answer `[["dev-07",40,1800006000,1800007170]]` (device, count, first and last timestamp)
 - One device's history through the index: 0.6 ms, answer `[[500,22.83]]`
-- `GET /verify` afterwards: `{"ok":true,"txid":10001,"pages":327,"free_pages":7,"keyspaces":4,"keys":20023}`
+- `GET /verify` afterwards: `{"ok":true,"txid":10001,"pages":326,"free_pages":7,"keyspaces":4,"keys":20023}`
 
 ## Case study: a checkout that is never half done
 

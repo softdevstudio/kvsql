@@ -130,9 +130,9 @@ Steps:
 1. [x] Phase 0: this plan.
 2. [x] bench/neighbours crate and its README (GlueSQL's SQL reads use 10,000 of the shuffled keys, as each statement costs about 0.25 ms whatever the table size; sizes show file length and allocated bytes, since fjall preallocates a sparse 64 MiB journal).
 3. [x] record-results.sh and the CI jobs (neighbours at small size, Windows engine tests).
-4. [ ] Independent review of the method (one agent, at most two rounds), fixes.
-5. [ ] Recorded run; report to YK with the numbers for the go/no-go.
+4. [x] Independent review of the method, two rounds. Round 1 blocker: every GlueSQL autocommit SELECT opened and committed a redb write transaction, so it synced to disk and the SQL row measured fsyncs (now its selects run in one transaction per round; autocommit kept as a labelled row over 500 keys). Should-fix, all fixed: fjall never left its 64 MiB memtable (now flushed and compacted after the load, its best case for reads), fixed store order on a noisy host (rounds interleaved, spread shown), checks on presence only (every value and scan key checked), sizes not comparable (said plainly). Nits fixed: Linux-only recording and the file system printed, fjall Snapshot::get, a drop guard, no ratio lines. Round 2: no blockers or should-fix; nits fixed (equal non-allocating checks, a KvSQL ReadTx::query row, commit count, fjall best-case wording).
+5. [x] Recorded run (test/results/latest/neighbours.md, Linux x86_64, 2 vCPUs, ext4, all checks passed). Reported to YK for the go/no-go.
 
 ## Next
 
-Phase A of KvSQL 0.2 is in progress (above). Phase B waits for YK's go/no-go on the numbers.
+Phase A of KvSQL 0.2 is done: the numbers are recorded and reported. Phase B (single-sync commit, prepared statements) and anything else wait for YK's go/no-go. The site gets the numbers only after his decision.
