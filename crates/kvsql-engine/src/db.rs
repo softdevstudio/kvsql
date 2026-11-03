@@ -26,9 +26,18 @@ use crate::storage::{FileStorage, Storage};
 use crate::tree::{self, Page, PageRead, PageWrite, TreeStats, Val, MAX_KEY_LEN, MAX_VALUE_LEN};
 
 const MAGIC: &[u8; 8] = b"KVSQLDB\0";
-const FORMAT_VERSION: u32 = 1;
+/// Version 2 commits sync once and carry a commit record; version 1 files
+/// (two syncs per commit, no record) are still read, and become version 2
+/// at their first commit.
+const FORMAT_VERSION: u32 = 2;
 const FREE_HDR: usize = HEADER + 12;
 const FREE_PER_PAGE: usize = (PAGE_SIZE - FREE_HDR) / 8;
+/// Commit record page: next record page (8), entry count (4), the commit's
+/// transaction id (8), then entries of page id (8) and that page's stored
+/// CRC-32C (4).
+const REC_HDR: usize = HEADER + 20;
+const REC_ENTRY: usize = 12;
+const REC_PER_PAGE: usize = (PAGE_SIZE - REC_HDR) / REC_ENTRY;
 const CACHE_SHARDS: usize = 16;
 
 /// Tuning knobs for [`Db::open_with`].
@@ -51,6 +60,13 @@ struct Meta {
     page_count: u64,
     free_head: u64,
     free_count: u64,
+    /// First commit record page, 0 when the commit has none (version 1
+    /// files and the empty file's first meta page).
+    rec_head: u64,
+    /// Entries in the commit record.
+    rec_count: u64,
+    /// CRC-32C over every record entry in order.
+    rec_crc: u32,
 }
 
 impl Meta {
@@ -64,6 +80,9 @@ impl Meta {
         put_u64(&mut p, HEADER + 32, self.page_count);
         put_u64(&mut p, HEADER + 40, self.free_head);
         put_u64(&mut p, HEADER + 48, self.free_count);
+        put_u64(&mut p, HEADER + 56, self.rec_head);
+        put_u64(&mut p, HEADER + 64, self.rec_count);
+        put_u32(&mut p, HEADER + 72, self.rec_crc);
         page::seal(&mut p, slot);
         p
     }
@@ -72,23 +91,32 @@ impl Meta {
         if page::check(p, slot).ok()? != PageType::Meta {
             return None;
         }
+        let version = get_u32(p, HEADER + 8);
         if &p[HEADER..HEADER + 8] != MAGIC
-            || get_u32(p, HEADER + 8) != FORMAT_VERSION
+            || !(version == 1 || version == FORMAT_VERSION)
             || get_u32(p, HEADER + 12) != PAGE_SIZE as u32
         {
             return None;
         }
+        let v2 = version == FORMAT_VERSION;
         let m = Meta {
             txid: get_u64(p, HEADER + 16),
             dir_root: get_u64(p, HEADER + 24),
             page_count: get_u64(p, HEADER + 32),
             free_head: get_u64(p, HEADER + 40),
             free_count: get_u64(p, HEADER + 48),
+            rec_head: if v2 { get_u64(p, HEADER + 56) } else { 0 },
+            rec_count: if v2 { get_u64(p, HEADER + 64) } else { 0 },
+            rec_crc: if v2 { get_u32(p, HEADER + 72) } else { 0 },
         };
+        // In version 2 every commit after the first meta page has a record.
         let sane = m.page_count >= 2
             && m.dir_root < m.page_count
             && m.free_head < m.page_count
             && m.free_count < m.page_count
+            && m.rec_head < m.page_count
+            && m.rec_count < m.page_count
+            && (!v2 || m.txid == 0 || m.rec_head >= 2)
             && m.txid % 2 == slot;
         sane.then_some(m)
     }
@@ -354,6 +382,66 @@ pub struct Db {
     shared: Shared,
 }
 
+/// Check a meta page's commit record: every page the commit wrote must read
+/// back sealed, with the CRC the record holds for it. Returns the record's
+/// pages when the commit is whole, `None` when it is not. A meta page
+/// without a record (version 1, or the empty file's first meta page) was
+/// synced on its own and is whole.
+fn check_record(store: &dyn Storage, m: &Meta) -> Result<Option<Vec<u64>>> {
+    if m.rec_head == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let file_len = store.len()?;
+    let read = |id: u64| -> Result<Option<Vec<u8>>> {
+        if id >= m.page_count || (id + 1) * PAGE_SIZE as u64 > file_len {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; PAGE_SIZE];
+        store.read_at(id * PAGE_SIZE as u64, &mut buf)?;
+        Ok(Some(buf))
+    };
+    let mut rec_pages = Vec::new();
+    let mut entries: Vec<(u64, u32)> = Vec::new();
+    let mut crc_input = Vec::new();
+    let mut id = m.rec_head;
+    while id != 0 {
+        if id < 2 || rec_pages.contains(&id) || rec_pages.len() as u64 > m.page_count {
+            return Ok(None);
+        }
+        let Some(p) = read(id)? else {
+            return Ok(None);
+        };
+        if !matches!(page::check(&p, id), Ok(PageType::Record))
+            || get_u64(&p, HEADER + 12) != m.txid
+        {
+            return Ok(None);
+        }
+        let n = get_u32(&p, HEADER + 8) as usize;
+        if n > REC_PER_PAGE {
+            return Ok(None);
+        }
+        for j in 0..n {
+            let at = REC_HDR + REC_ENTRY * j;
+            crc_input.extend_from_slice(&p[at..at + REC_ENTRY]);
+            entries.push((get_u64(&p, at), get_u32(&p, at + 8)));
+        }
+        rec_pages.push(id);
+        id = get_u64(&p, HEADER);
+    }
+    if entries.len() as u64 != m.rec_count || crate::crc32::crc32c(&crc_input) != m.rec_crc {
+        return Ok(None);
+    }
+    for (pid, crc) in entries {
+        let Some(p) = read(pid)? else {
+            return Ok(None);
+        };
+        if pid < 2 || page::check(&p, pid).is_err() || get_u32(&p, 0) != crc {
+            return Ok(None);
+        }
+    }
+    Ok(Some(rec_pages))
+}
+
 impl Db {
     /// Open or create a database file. The file stays locked against other
     /// processes until the handle is dropped.
@@ -367,18 +455,30 @@ impl Db {
     /// Open on any [`Storage`].
     pub fn open_with(store: Box<dyn Storage>, opts: Options) -> Result<Db> {
         let len = store.len()?;
-        let mut best: Option<Meta> = None;
+        let mut metas: Vec<Meta> = Vec::new();
         for slot in 0..2u64 {
             if len >= (slot + 1) * PAGE_SIZE as u64 {
                 let mut buf = vec![0u8; PAGE_SIZE];
                 store.read_at(slot * PAGE_SIZE as u64, &mut buf)?;
                 if let Some(m) = Meta::decode(&buf, slot) {
-                    if best.is_none_or(|b| m.txid > b.txid) {
-                        best = Some(m);
-                    }
+                    metas.push(m);
                 }
             }
         }
+        // Newest first. A commit syncs once, after writing its pages, its
+        // record and its meta page, so a crash can leave a meta page whose
+        // pages never reached the disk: such a commit never returned, and
+        // the one before it (synced in full before it began) is used.
+        metas.sort_by_key(|m| std::cmp::Reverse(m.txid));
+        let mut best: Option<(Meta, Vec<u64>)> = None;
+        for m in metas {
+            if let Some(rec_pages) = check_record(store.as_ref(), &m)? {
+                best = Some((m, rec_pages));
+                break;
+            }
+        }
+        let rec_pages = best.as_ref().map(|(_, r)| r.clone()).unwrap_or_default();
+        let best = best.map(|(m, _)| m);
         let meta = match best {
             Some(m) => m,
             None if len <= 2 * PAGE_SIZE as u64 => {
@@ -390,6 +490,9 @@ impl Db {
                     page_count: 2,
                     free_head: 0,
                     free_count: 0,
+                    rec_head: 0,
+                    rec_count: 0,
+                    rec_crc: 0,
                 };
                 let first = m.encode(0);
                 let mut have = vec![0u8; len as usize];
@@ -461,6 +564,14 @@ impl Db {
                 return corrupt(format!("free list holds a bad page id {}", f.id));
             }
         }
+        // The record pages of the commit just opened are freed by the next
+        // commit, the same way as its free-list pages.
+        for &rp in &rec_pages {
+            if !seen.insert(rp) {
+                return corrupt(format!("commit record page {rp} is also listed free"));
+            }
+        }
+        free_pages.extend(rec_pages);
         {
             let mut st = lock(&shared.state);
             st.free_pages = free_pages;
@@ -1248,20 +1359,30 @@ impl WriteTx<'_> {
         self.pending.extend(old_free_pages);
         let txid = self.base.txid + 1;
 
-        // Pick pages for the new free list from pages that are safe to
-        // overwrite now. Taking a page shrinks the list, so loop.
+        // Pick pages for the new free list and the commit record from pages
+        // that are safe to overwrite now. Taking a page shrinks the free
+        // list and grows the record, so loop until both fit.
         let mut list_pages = Vec::new();
+        let mut rec_pages = Vec::new();
         loop {
             let total = self.reusable.len() + self.held.len() + self.pending.len();
-            if total.div_ceil(FREE_PER_PAGE) <= list_pages.len() {
+            let need_list = total.div_ceil(FREE_PER_PAGE) > list_pages.len();
+            let entries = self.dirty.len() + list_pages.len();
+            let need_rec = entries.div_ceil(REC_PER_PAGE).max(1) > rec_pages.len();
+            if !need_list && !need_rec {
                 break;
             }
-            match self.reusable.pop() {
-                Some(id) => list_pages.push(id),
+            let id = match self.reusable.pop() {
+                Some(id) => id,
                 None => {
-                    list_pages.push(self.page_count);
                     self.page_count += 1;
+                    self.page_count - 1
                 }
+            };
+            if need_list {
+                list_pages.push(id);
+            } else {
+                rec_pages.push(id);
             }
         }
         let mut free: Vec<Free> = self
@@ -1287,14 +1408,6 @@ impl WriteTx<'_> {
             list_bodies.push((pid, p));
         }
 
-        let meta = Meta {
-            txid,
-            dir_root: self.dir_root,
-            page_count: self.page_count,
-            free_head: list_pages.first().copied().unwrap_or(0),
-            free_count: ids.len() as u64,
-        };
-
         let mut writes: Vec<(u64, Page)> = std::mem::take(&mut self.dirty)
             .into_iter()
             .map(|(id, p)| {
@@ -1304,6 +1417,44 @@ impl WriteTx<'_> {
             })
             .collect();
         writes.sort_unstable_by_key(|(id, _)| *id);
+
+        // The commit record: every page this commit writes, with its CRC.
+        // Opening checks it, so the meta page can go out with the rest and
+        // one sync covers the whole commit.
+        let mut entries: Vec<(u64, u32)> = writes
+            .iter()
+            .map(|(id, p)| (*id, get_u32(p, 0)))
+            .chain(list_bodies.iter().map(|(id, p)| (*id, get_u32(p, 0))))
+            .collect();
+        entries.sort_unstable_by_key(|e| e.0);
+        let mut rec_crc_input = Vec::with_capacity(entries.len() * REC_ENTRY);
+        let rec_chunks: Vec<&[(u64, u32)]> = entries.chunks(REC_PER_PAGE).collect();
+        for (i, &pid) in rec_pages.iter().enumerate() {
+            let chunk = rec_chunks.get(i).copied().unwrap_or(&[]);
+            let mut p = new_page(PageType::Record);
+            put_u64(&mut p, HEADER, rec_pages.get(i + 1).copied().unwrap_or(0));
+            put_u32(&mut p, HEADER + 8, chunk.len() as u32);
+            put_u64(&mut p, HEADER + 12, txid);
+            for (j, &(id, crc)) in chunk.iter().enumerate() {
+                let at = REC_HDR + REC_ENTRY * j;
+                put_u64(&mut p, at, id);
+                put_u32(&mut p, at + 8, crc);
+                rec_crc_input.extend_from_slice(&p[at..at + REC_ENTRY]);
+            }
+            page::seal(&mut p, pid);
+            list_bodies.push((pid, p));
+        }
+
+        let meta = Meta {
+            txid,
+            dir_root: self.dir_root,
+            page_count: self.page_count,
+            free_head: list_pages.first().copied().unwrap_or(0),
+            free_count: ids.len() as u64,
+            rec_head: rec_pages[0],
+            rec_count: entries.len() as u64,
+            rec_crc: crate::crc32::crc32c(&rec_crc_input),
+        };
         let store = &self.shared.store;
         let result = (|| -> Result<()> {
             // Pages with consecutive ids go out in one write.
@@ -1331,7 +1482,6 @@ impl WriteTx<'_> {
             if run_pages > 0 {
                 store.write_at(run_start * PAGE_SIZE as u64, &run)?;
             }
-            store.sync()?;
             let slot = meta.txid % 2;
             store.write_at(slot * PAGE_SIZE as u64, &meta.encode(slot))?;
             store.sync()?;
@@ -1354,6 +1504,7 @@ impl WriteTx<'_> {
         }
         let mut st = lock(&self.shared.state);
         st.meta = meta;
+        list_pages.extend_from_slice(&rec_pages);
         st.free_pages = list_pages;
         st.free = free;
         if schema_changed {

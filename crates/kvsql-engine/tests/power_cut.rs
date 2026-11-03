@@ -64,7 +64,7 @@ fn power_cut_never_loses_or_tears_a_commit() {
 
         // Power fails after 0..24 more writes or syncs, or not at all.
         // Consecutive pages go out in one write, so a commit is a handful
-        // of writes and two syncs.
+        // of writes and one sync.
         if rng.chance(85) {
             storage.fail_after(rng.below(24));
         }

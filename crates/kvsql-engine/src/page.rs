@@ -23,6 +23,7 @@ pub enum PageType {
     Leaf = 3,
     Overflow = 4,
     Free = 5,
+    Record = 6,
 }
 
 impl PageType {
@@ -33,6 +34,7 @@ impl PageType {
             3 => PageType::Leaf,
             4 => PageType::Overflow,
             5 => PageType::Free,
+            6 => PageType::Record,
             _ => return None,
         })
     }
