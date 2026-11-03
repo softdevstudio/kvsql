@@ -129,7 +129,7 @@ fn main() {
         "- Reads: warm, shuffled key order, every key once per round, median of {ROUNDS} rounds"
     );
     println!("- SQLite: WAL journal with synchronous=FULL, so each commit is synced like a KvSQL commit; the plain keyspace is compared with a `WITHOUT ROWID` table `kv (k BLOB PRIMARY KEY, v BLOB)`");
-    println!("- KvSQL has no prepared statements yet, so every KvSQL SQL call parses its text. SQLite is shown both with a cached prepared statement and parsing each time\n");
+    println!("- KvSQL SQL is shown both from text (its parsed-statement cache makes repeat texts cheap to parse) and prepared with `Db::prepare`, which also keeps the compiled plan. SQLite is shown both with a cached prepared statement and parsing each time\n");
 
     // ---- KvSQL setup
     let kpath = temp("kvsql.db");
@@ -229,6 +229,15 @@ fn main() {
     });
     row("KvSQL `SELECT name FROM t WHERE id = ?` (SQL door)", d);
     let k_sql = d;
+    let st = db.prepare("SELECT name FROM t WHERE id = ?").unwrap();
+    let d = per_op(order.len(), || {
+        for &i in &order {
+            let r = db.execute_prepared(&st, &[Value::Int(i)]).unwrap();
+            assert_eq!(r.rows.len(), 1);
+        }
+    });
+    row("KvSQL same query, prepared (`Db::execute_prepared`)", d);
+    let k_prep = d;
     let d = per_op(order.len(), || {
         let mut st = conn.prepare_cached("SELECT v FROM kv WHERE k = ?").unwrap();
         for &i in &order {
@@ -478,6 +487,10 @@ fn main() {
         "- KvSQL SQL point select against SQLite parsing each time: {:.2}x the speed; against SQLite prepared: {:.2}x.",
         s_parse.as_nanos() as f64 / k_sql.as_nanos() as f64,
         s_prep.as_nanos() as f64 / k_sql.as_nanos() as f64
+    );
+    println!(
+        "- KvSQL prepared point select against SQLite prepared: {:.2}x the speed.",
+        s_prep.as_nanos() as f64 / k_prep.as_nanos() as f64
     );
     println!("- A figure above 1x means KvSQL is faster.");
 

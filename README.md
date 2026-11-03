@@ -7,7 +7,9 @@ There are two products:
 - **KvSQL Engine**, a Rust library you embed in your program. One file on disk, no server.
 - **KvSQL DB**, a database server and command-line shell built on the engine.
 
-Status: first release, 0.1.0. The storage engine, key-value API, snapshot readers, SQL, the server and the shell work and are tested. The file format may still change before 1.0.
+Status: 0.2.0. The storage engine, key-value API, snapshot readers, SQL with prepared statements, the server and the shell work and are tested. A commit syncs to disk once. The file format may still change before 1.0.
+
+Upgrading from 0.1: 0.2 opens 0.1 files and moves them to file format version 2 at their first commit. After that, 0.1 can't open them, so keep a copy if you might go back.
 
 ## Download
 
@@ -31,7 +33,7 @@ Add it as a Git dependency:
 
 ```toml
 [dependencies]
-kvsql-engine = { git = "https://github.com/softdevstudio/kvsql", tag = "v0.1.0" }
+kvsql-engine = { git = "https://github.com/softdevstudio/kvsql", tag = "v0.2.0" }
 ```
 
 The engine has no dependencies of its own.
@@ -95,6 +97,20 @@ tx.put_row("users", &[Value::Int(3), Value::Text("Alan".into()), Value::Text("Lo
 tx.commit()?;
 ```
 
+A statement you run many times can be prepared once. A prepared SELECT keeps its compiled plan, so a run fills in the parameters and reads:
+
+```rust
+let by_id = db.prepare("SELECT name FROM users WHERE id = ?")?;
+for id in [1, 2, 3] {
+    let r = db.execute_prepared(&by_id, &[Value::Int(id)])?;
+}
+// Inside a snapshot, or a write transaction, the same statement works too.
+let mut snap = db.begin_read()?;
+let r = snap.query_prepared(&by_id, &[Value::Int(2)])?;
+```
+
+The plan is kept while the schema stays the same and made again after a CREATE or DROP. A statement belongs to the handle that prepared it.
+
 A table is a keyspace of the same name, and each row sits under its primary key. That is why both doors see the same bytes. A plain keyspace with no table definition reads in SQL as a two-column table, `key` and `value`.
 
 The SQL is a subset close to SQLite with STRICT tables: CREATE/DROP TABLE and INDEX, INSERT, UPDATE, DELETE, and SELECT with joins, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT, aggregates and the common functions. The full list, and what is missing, is in [docs/sql.md](docs/sql.md).
@@ -127,7 +143,7 @@ Set `--token` (or `KVSQL_TOKEN`) to require a bearer token. There is no TLS, so 
 
 When `commit` returns, the transaction is on disk. If the program crashes or the power goes during a commit, reopening the file gives you either the whole transaction or none of it. Never part of one.
 
-How that holds: changed pages are written to unused places in the file, the file is synced, and only then is a small meta page written that points at the new data. Until that meta page lands, the old one still points at the old, untouched data. Details are in [docs/file-format.md](docs/file-format.md).
+How that holds: changed pages are written to unused places in the file, along with a commit record that lists every page the commit wrote and its checksum, and a small meta page that points at the new data. Then the file is synced, once. If the power goes before that sync finishes, any of those writes may be missing. On open, the newest meta page counts only if every page its record lists is on disk with the right checksum; otherwise the file opens at the previous commit, whose pages this commit never touched. Details are in [docs/file-format.md](docs/file-format.md).
 
 If a commit fails part way (a disk error, say), the handle refuses further use. Reopen the file to continue from the last good commit.
 
@@ -136,11 +152,12 @@ Only one process can open a file at a time. A second open gets `Error::Locked`.
 ## How it is tested
 
 - A model check runs thousands of random transactions (puts, deletes, large values, dropped keyspaces, rolled-back transactions) against an in-memory copy and verifies the whole file after every commit.
+- Real files are damaged the way a crash before the sync can leave them: a page the commit wrote missing, an older page in its place, a torn commit record, an older commit's record. Each must open at the commit before. A file written by KvSQL 0.1 must open, take a commit and reopen.
 - A simulated disk cuts the power at a random write or sync inside commits. It then keeps, drops, reorders or tears the writes that were not yet synced, the way a real disk can. The reopened file must verify and hold exactly the last finished commit or the one in flight.
 - Half the power-cut rounds keep a reader open across the commits; its view must not change.
 - Reader threads hold snapshots for random times while a writer moves money between accounts and churns pages. Every snapshot must show the same total twice and every value intact.
 - A real writer process is killed with SIGKILL at random moments. Every commit it reported as done must be in the file.
-- Random SQL statements run on KvSQL and on SQLite side by side, and every answer, row count and error must match. The generator steers some WHERE clauses toward key and index lookups so the planner's shortcuts get checked too.
+- Random SQL statements run on KvSQL and on SQLite side by side, and every answer, row count and error must match. Each query also runs as a prepared statement with its literals turned into parameters, twice, and must answer the same. The generator steers some WHERE clauses toward key and index lookups so the planner's shortcuts get checked too.
 - Power cuts during SQL writes: after each one the file verifies, every index matches its table exactly, and the table holds the state before the statement or after it.
 - Many HTTP clients write and read at once; readers must always see the same money total.
 - A real `kvsqld` is killed with SIGKILL while clients write to it. Every write that got a 200 must be in the file afterwards, and the file must verify.
@@ -151,7 +168,7 @@ Run them all and record the output:
 bash scripts/record-results.sh
 ```
 
-The output goes to `test/results/latest/checks.log`, and a benchmark against SQLite on the same machine goes to `test/results/latest/bench.md`. The benchmark lists its conditions at the top: both databases on real files with the same page cache, reads in shuffled key order, every commit synced to disk.
+The output goes to `test/results/latest/checks.log`, a benchmark against SQLite on the same machine goes to `test/results/latest/bench.md`, and one against redb, fjall and GlueSQL to `test/results/latest/neighbours.md` (method in [bench/neighbours/README.md](bench/neighbours/README.md)). The benchmark lists its conditions at the top: both databases on real files with the same page cache, reads in shuffled key order, every commit synced to disk.
 
 ## License
 

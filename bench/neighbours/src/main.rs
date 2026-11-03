@@ -523,8 +523,9 @@ fn main() {
     );
 
     // ----------------------------------------------------------- SQL point
+    let kst = kdb.prepare("SELECT name FROM t WHERE id = ?").unwrap();
     println!("## Point select by primary key through SQL\n");
-    println!("`SELECT name FROM t WHERE id = ?` with the id as a parameter, and the name checked. KvSQL and GlueSQL parse the text on every call (KvSQL keeps a parsed-statement cache; GlueSQL has no prepared statements). GlueSQL runs each round's selects inside one `BEGIN` ... `COMMIT`: on its redb storage an autocommit statement, a SELECT included, opens and commits a redb write transaction and so syncs to disk. That autocommit form is shown on its own row, over {} keys per round. SQLite is shown prepared once and parsing every time. The last row reads the same row through KvSQL's key door.\n", auto_order.len());
+    println!("`SELECT name FROM t WHERE id = ?` with the id as a parameter, and the name checked. KvSQL is shown from text (its parsed-statement cache makes a repeated text cheap to parse) and prepared (`Db::prepare`, which also keeps the compiled plan); GlueSQL has no prepared statements and plans every call. GlueSQL runs each round's selects inside one `BEGIN` ... `COMMIT`: on its redb storage an autocommit statement, a SELECT included, opens and commits a redb write transaction and so syncs to disk. That autocommit form is shown on its own row, over {} keys per round. SQLite is shown prepared once and parsing every time. The last row reads the same row through KvSQL's key door.\n", auto_order.len());
     table(
         "select",
         vec![
@@ -536,6 +537,23 @@ fn main() {
                     assert!(text_row(&r.rows, &names[i]));
                 }
             }),
+            case("KvSQL `Db::execute_prepared`", n, || {
+                for &i in &order {
+                    let r = kdb.execute_prepared(&kst, &[Value::Int(i as i64)]).unwrap();
+                    assert!(text_row(&r.rows, &names[i]));
+                }
+            }),
+            case(
+                "KvSQL `ReadTx::query_prepared`, one snapshot per round",
+                n,
+                || {
+                    let mut tx = kdb.begin_read().unwrap();
+                    for &i in &order {
+                        let r = tx.query_prepared(&kst, &[Value::Int(i as i64)]).unwrap();
+                        assert!(text_row(&r.rows, &names[i]));
+                    }
+                },
+            ),
             case("KvSQL `ReadTx::query`, one snapshot per round", n, || {
                 let mut tx = kdb.begin_read().unwrap();
                 for &i in &order {

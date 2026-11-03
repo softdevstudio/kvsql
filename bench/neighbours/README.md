@@ -29,7 +29,7 @@ KVSQL_NEIGHBOURS_ROWS=2000 KVSQL_NEIGHBOURS_COMMITS=20 cargo run --release --loc
 | Key get, one call per read | `Db::get` | read transaction per get | `Keyspace::get` | | prepared select on a `WITHOUT ROWID` table |
 | Key get in one open snapshot | `ReadTx::get` | `ReadOnlyTable::get` | `Snapshot::get` | | |
 | Range scan of 100 keys | `Db::scan` | `range` in a read transaction per scan | `Keyspace::range` | | prepared `WHERE k >= ? ORDER BY k LIMIT ?` |
-| Point select by primary key in SQL | `Db::execute`, and `ReadTx::query` in one snapshot | | | `execute_with_params`, in a transaction and autocommit | prepared, and parsed each call |
+| Point select by primary key in SQL | `Db::execute`, `Db::execute_prepared`, and `ReadTx::query`, `ReadTx::query_prepared` in one snapshot | | | `execute_with_params`, in a transaction and autocommit | prepared, and parsed each call |
 | Synced single-key commit | yes | yes | yes | yes, a table row | yes |
 | Bulk load in one transaction | keys and rows | keys | keys | rows | keys and rows |
 
@@ -38,7 +38,7 @@ KVSQL_NEIGHBOURS_ROWS=2000 KVSQL_NEIGHBOURS_COMMITS=20 cargo run --release --loc
 - fjall is an LSM tree. Its writes go to a journal and memory first and are compacted in the background on other threads, so a synced commit does less work at commit time and more later. It has no SQL.
 - redb is a copy-on-write B-tree like KvSQL. It has no SQL.
 - GlueSQL is a SQL engine over a choice of storages; here it runs on its redb storage, which pins redb 2.6, not 4.4. It has no prepared statements, so every call plans the statement again. Its bulk load goes through `INSERT` statements of 1000 rows, the others through API calls.
-- KvSQL has no prepared statements either; it keeps a cache of parsed statements for texts up to 2 KiB, which this benchmark hits.
+- KvSQL is shown both from text, where a cache of parsed statements for texts up to 2 KiB saves the parse, and prepared with `Db::prepare` (from 0.2), which also keeps the compiled plan.
 - SQLite is written in C and has had decades of tuning. It is here as the reference the 0.1 benchmark already used.
 - Sizes can't be compared across stores: KvSQL and SQLite hold the keys, the table and the space left by the synced commits (one key each); redb and fjall hold only the keys; GlueSQL only the table.
 - None of this says how the stores behave with many threads, larger values, data bigger than the cache, or a different disk. The figures move by 20 to 30 percent between runs on a shared cloud machine, which is why each row shows its spread.

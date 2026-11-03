@@ -17,6 +17,7 @@ let r = db.execute("SELECT name FROM users WHERE id = ?", &[Value::Int(1)])?;
 - `WriteTx::execute` runs statements inside your own transaction. A statement that fails is undone on its own, and the transaction carries on.
 - `ReadTx::query` runs SELECT on a read snapshot.
 - `?` placeholders take values from the `params` slice, in order.
+- `Db::prepare` parses once and returns a `Statement`; run it with `Db::execute_prepared`, `ReadTx::query_prepared` or `WriteTx::execute_prepared`. A single prepared SELECT keeps its compiled plan, including the access path, for the schema it was compiled against, and compiles again after a schema change. Parameters fill the plan's slots at each run with the same affinity rules as a literal. Inside a write transaction a prepared statement runs from its parsed form, since the transaction may change the schema. A statement prepared on one handle is refused by another.
 
 ## Tables and the key-value door
 
