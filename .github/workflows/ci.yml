@@ -21,6 +21,14 @@ jobs:
         env:
           # The neighbours benchmark has its own job below.
           KVSQL_NEIGHBOURS: "0"
+      # Job logs can't be read from the agent's sessions; failing test
+      # lines come back as annotations instead.
+      - if: failure()
+        shell: bash
+        run: |
+          grep -E "panicked|FAILED|failed|error\[|error:" test/results/latest/checks.log | head -40 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
