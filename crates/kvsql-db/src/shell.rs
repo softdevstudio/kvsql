@@ -12,7 +12,8 @@ use crate::json::{self, Json};
 /// Where commands go.
 pub enum Backend {
     Remote(Client),
-    Local(Db),
+    // Boxed: a Db is much larger than a Client on some platforms.
+    Local(Box<Db>),
 }
 
 type Res<T> = Result<T, String>;

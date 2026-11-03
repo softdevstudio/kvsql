@@ -612,7 +612,7 @@ fn use_examples() {
 
     println!("## Use example: the kvsql shell on a file\n");
     let path = temp("shell.db");
-    let mut b = Backend::Local(Db::open(&path).unwrap());
+    let mut b = Backend::Local(Box::new(Db::open(&path).unwrap()));
     println!("```");
     for line in [
         "CREATE TABLE jobs (id INTEGER PRIMARY KEY, kind TEXT, state TEXT)",

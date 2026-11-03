@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     }
     let mut backend = match file {
         Some(path) => match Db::open(&path) {
-            Ok(db) => Backend::Local(db),
+            Ok(db) => Backend::Local(Box::new(db)),
             Err(e) => {
                 eprintln!("kvsql: cannot open {path}: {e}");
                 return ExitCode::FAILURE;
