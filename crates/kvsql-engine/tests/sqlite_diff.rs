@@ -544,6 +544,105 @@ fn sqlite_rows(conn: &rusqlite::Connection, sql: &str) -> rusqlite::Result<Vec<V
     Ok(out)
 }
 
+/// The query with its string literals, and numbers right after a comparison
+/// operator, turned into `?` parameters: (text, values). Numbers elsewhere
+/// stay, since ORDER BY 1 or LIMIT 2 mean something else as parameters.
+fn parameterize(sql: &str) -> (String, Vec<Value>) {
+    let b = sql.as_bytes();
+    let (mut out, mut vals) = (String::new(), Vec::new());
+    let mut i = 0;
+    let prev_sym = |out: &str| out.trim_end().chars().last();
+    while i < b.len() {
+        let c = b[i] as char;
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.push_str(&sql[start..i]);
+            // A blob literal x'..' stays as it is.
+            if &sql[start..i] == "x" && i < b.len() && b[i] == b'\'' {
+                let end = sql[i + 1..].find('\'').unwrap() + i + 2;
+                out.push_str(&sql[i..end]);
+                i = end;
+            }
+        } else if c == '\'' {
+            let mut j = i + 1;
+            let mut text = String::new();
+            loop {
+                if b[j] == b'\'' {
+                    if j + 1 < b.len() && b[j + 1] == b'\'' {
+                        text.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                let ch = sql[j..].chars().next().unwrap();
+                text.push(ch);
+                j += ch.len_utf8();
+            }
+            out.push('?');
+            vals.push(Value::Text(text));
+            i = j + 1;
+        } else if c.is_ascii_digit() && matches!(prev_sym(&out), Some('=' | '<' | '>')) {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            let lit = &sql[start..i];
+            out.push('?');
+            vals.push(if lit.contains('.') {
+                Value::Real(lit.parse().unwrap())
+            } else {
+                Value::Int(lit.parse().unwrap())
+            });
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    (out, vals)
+}
+
+/// A query run as a prepared statement with its literals as parameters must
+/// answer exactly like the literal text, the first time (compiling the
+/// plan) and the second (reusing it), on the handle and in a snapshot.
+fn check_prepared(
+    db: &Db,
+    sql: &str,
+    want: &Result<Vec<Vec<Value>>, kvsql_engine::Error>,
+    ctx: &str,
+) {
+    let (text, vals) = parameterize(sql);
+    let st = match db.prepare(&text) {
+        Ok(st) => st,
+        Err(e) => {
+            assert!(want.is_err(), "{ctx}: prepare failed: {e}\n  as {text}");
+            return;
+        }
+    };
+    assert_eq!(st.param_count(), vals.len(), "{ctx}: {text}");
+    for round in 0..2 {
+        let got = if round == 0 {
+            db.execute_prepared(&st, &vals).map(|r| r.rows)
+        } else {
+            db.begin_read()
+                .unwrap()
+                .query_prepared(&st, &vals)
+                .map(|r| r.rows)
+        };
+        match (want, &got) {
+            (Ok(w), Ok(g)) => assert!(
+                same_rows(w, g),
+                "{ctx}: prepared answer differs (run {round})\n  as {text} with {vals:?}\n  literal: {w:?}\n  prepared: {g:?}"
+            ),
+            (Err(_), Err(_)) => {}
+            _ => panic!("{ctx}: prepared differs (run {round})\n  as {text} with {vals:?}\n  literal: {want:?}\n  prepared: {got:?}"),
+        }
+    }
+}
+
 fn same_value(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Real(x), Value::Real(y)) => (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0),
@@ -604,6 +703,7 @@ fn random_sql_matches_sqlite() {
         } else {
             let theirs = sqlite_rows(&conn, &sql);
             let ours = db.execute(&sql, &[]).map(|r| r.rows);
+            check_prepared(&db, &sql, &ours, &ctx);
             match (theirs, ours) {
                 (Ok(t), Ok(o)) => {
                     let (t, o) = if ordered {

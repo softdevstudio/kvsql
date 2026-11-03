@@ -58,6 +58,7 @@ pub mod sim;
 
 pub use db::{Db, Options, ReadTx, VerifyReport, WriteTx};
 pub use error::{Error, Result};
+pub use sql::Statement;
 pub use storage::{FileStorage, Storage};
 pub use tree::{MAX_KEY_LEN, MAX_VALUE_LEN};
 

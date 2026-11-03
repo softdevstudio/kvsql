@@ -44,6 +44,9 @@ pub enum AggKind {
 #[derive(Clone, Debug)]
 pub enum E {
     Lit(Value),
+    /// A statement parameter, left as a slot in a prepared statement's plan
+    /// and replaced by [`E::with_params`] before the plan runs.
+    Param(usize),
     Col(usize),
     Agg(usize),
     Neg(Box<E>),
@@ -64,7 +67,7 @@ impl E {
     /// True when the expression reads no column and no aggregate.
     pub fn is_const(&self) -> bool {
         match self {
-            E::Lit(_) => true,
+            E::Lit(_) | E::Param(_) => true,
             E::Col(_) | E::Agg(_) => false,
             E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) | E::Aff(a, _) => a.is_const(),
             E::Bin(_, a, b) | E::Like(a, b, _) => a.is_const() && b.is_const(),
@@ -90,10 +93,47 @@ impl E {
         m
     }
 
+    /// A copy with every parameter slot replaced by its value. A slot under
+    /// an affinity becomes the converted literal, exactly as binding the
+    /// value directly would have made it.
+    pub fn with_params(&self, params: &[Value]) -> E {
+        let b = |x: &E| Box::new(x.with_params(params));
+        let o = |x: &Option<Box<E>>| x.as_ref().map(|x| b(x));
+        let v = |l: &[E]| l.iter().map(|x| x.with_params(params)).collect::<Vec<_>>();
+        match self {
+            E::Param(i) => E::Lit(params[*i].clone()),
+            E::Lit(_) | E::Col(_) | E::Agg(_) => self.clone(),
+            E::Neg(a) => E::Neg(b(a)),
+            E::Not(a) => E::Not(b(a)),
+            E::Bin(op, x, y) => E::Bin(*op, b(x), b(y)),
+            E::IsNull(a, n) => E::IsNull(b(a), *n),
+            E::In(a, l, n) => E::In(b(a), v(l), *n),
+            E::Between(a, l, h, n) => E::Between(b(a), b(l), b(h), *n),
+            E::Like(a, p, n) => E::Like(b(a), b(p), *n),
+            E::Func(f, args) => E::Func(*f, v(args)),
+            E::Cast(a, t) => E::Cast(b(a), *t),
+            E::Case(x, w, e) => E::Case(
+                o(x),
+                w.iter()
+                    .map(|(c, r)| (c.with_params(params), r.with_params(params)))
+                    .collect(),
+                o(e),
+            ),
+            E::Aff(a, aff) => wrap_aff(a.with_params(params), *aff),
+        }
+    }
+
+    /// True when the expression holds a parameter slot.
+    pub fn has_params(&self) -> bool {
+        let mut found = false;
+        self.visit(&mut |e| found |= matches!(e, E::Param(_)));
+        found
+    }
+
     fn visit(&self, f: &mut dyn FnMut(&E)) {
         f(self);
         match self {
-            E::Lit(_) | E::Col(_) | E::Agg(_) => {}
+            E::Lit(_) | E::Param(_) | E::Col(_) | E::Agg(_) => {}
             E::Neg(a) | E::Not(a) | E::IsNull(a, _) | E::Cast(a, _) | E::Aff(a, _) => a.visit(f),
             E::Bin(_, a, b) | E::Like(a, b, _) => {
                 a.visit(f);
@@ -207,7 +247,8 @@ fn text_to_number(s: &str) -> Option<Value> {
 
 pub struct Binder<'a> {
     pub scope: &'a Scope,
-    pub params: &'a [Value],
+    /// Parameter values, or `None` to leave parameters as slots.
+    pub params: Option<&'a [Value]>,
     /// Where aggregate calls go; `None` where aggregates are not allowed.
     pub aggs: Option<&'a mut Vec<AggSpec>>,
     /// Result column aliases a bare name may refer to (HAVING, GROUP BY,
@@ -265,7 +306,10 @@ impl Binder<'_> {
         let b = |s: &mut Self, x: &Expr| s.bind(x).map(Box::new);
         Ok(match e {
             Expr::Lit(v) => E::Lit(v.clone()),
-            Expr::Param(i) => E::Lit(self.params[*i].clone()),
+            Expr::Param(i) => match self.params {
+                Some(p) => E::Lit(p[*i].clone()),
+                None => E::Param(*i),
+            },
             Expr::Column { table, name } => match resolve(self.scope, table.as_deref(), name) {
                 Ok(i) => E::Col(i),
                 Err(e) => {
@@ -791,6 +835,11 @@ fn call(f: Func, args: Vec<Value>) -> Result<Value> {
 pub fn eval(e: &E, row: &[Value], aggs: &[Value]) -> Result<Value> {
     Ok(match e {
         E::Lit(v) => v.clone(),
+        E::Param(_) => {
+            return Err(Error::Sql(
+                "internal error: a parameter slot was not filled".into(),
+            ))
+        }
         E::Col(i) => row[*i].clone(),
         E::Agg(i) => aggs[*i].clone(),
         E::Neg(a) => match eval(a, row, aggs)?.to_number() {

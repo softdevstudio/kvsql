@@ -143,6 +143,78 @@ fn check_params(p: &Parsed, params: &[Value]) -> Result<()> {
     Ok(())
 }
 
+/// SQL parsed once by [`crate::Db::prepare`], to run many times with
+/// different parameters. A single SELECT also keeps its compiled plan
+/// (tables, columns, bound expressions, access path) and reuses it while the
+/// schema stays the same, so a run does little more than fill in the
+/// parameters and read. A statement belongs to the handle that prepared it.
+pub struct Statement {
+    pub(crate) db: u64,
+    sql: String,
+    pub(crate) parsed: Arc<Parsed>,
+    plan: Mutex<Option<(u64, Arc<exec::SelectPlan>)>>,
+}
+
+impl Statement {
+    pub(crate) fn new(db: u64, sql: &str, parsed: Arc<Parsed>) -> Statement {
+        Statement {
+            db,
+            sql: sql.to_string(),
+            parsed,
+            plan: Mutex::new(None),
+        }
+    }
+
+    /// The SQL text.
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    /// How many `?` parameters a run takes.
+    pub fn param_count(&self) -> usize {
+        self.parsed.params
+    }
+
+    /// True when every statement is a SELECT.
+    pub fn read_only(&self) -> bool {
+        self.parsed.read_only
+    }
+}
+
+impl std::fmt::Debug for Statement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statement").field("sql", &self.sql).finish()
+    }
+}
+
+/// Run a prepared statement in a read-only transaction. `generation` is the
+/// snapshot's schema generation, or `None` when plans must not be cached.
+pub(crate) fn query_prepared<K: Kv>(
+    kv: &mut K,
+    st: &Statement,
+    generation: Option<u64>,
+    params: &[Value],
+) -> Result<QueryResult> {
+    let p = &st.parsed;
+    let (Some(g), [parser::Stmt::Select(sel)]) = (generation, p.stmts.as_slice()) else {
+        return query(kv, p, params);
+    };
+    check_params(p, params)?;
+    let cached = lock(&st.plan)
+        .as_ref()
+        .filter(|(at, _)| *at == g)
+        .map(|(_, plan)| plan.clone());
+    let plan = match cached {
+        Some(plan) => plan,
+        None => {
+            let plan = Arc::new(exec::compile_select(kv, sel, None)?);
+            *lock(&st.plan) = Some((g, plan.clone()));
+            plan
+        }
+    };
+    exec::run_select(kv, &plan, params)
+}
+
 /// Run statements in a read-only transaction.
 pub(crate) fn query<K: Kv>(kv: &mut K, p: &Parsed, params: &[Value]) -> Result<QueryResult> {
     check_params(p, params)?;

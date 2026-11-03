@@ -594,3 +594,190 @@ fn failed_kv_door_put_keeps_indexes_exact() {
         vec![vec![i(2)]]
     );
 }
+
+#[test]
+fn prepared_statements_answer_like_execute() {
+    let db = db();
+    people(&db);
+    let st = db.prepare("SELECT name FROM people WHERE id = ?").unwrap();
+    assert_eq!(st.param_count(), 1);
+    assert!(st.read_only());
+    assert_eq!(st.sql(), "SELECT name FROM people WHERE id = ?");
+    for id in 0..7 {
+        let want = db
+            .execute("SELECT name FROM people WHERE id = ?", &[i(id)])
+            .unwrap()
+            .rows;
+        assert_eq!(db.execute_prepared(&st, &[i(id)]).unwrap().rows, want);
+        let mut r = db.begin_read().unwrap();
+        assert_eq!(r.query_prepared(&st, &[i(id)]).unwrap().rows, want);
+    }
+    // Affinity: a text parameter against an INTEGER key converts, as a
+    // literal would.
+    assert_eq!(
+        db.execute_prepared(&st, &[t("2")]).unwrap().rows,
+        vec![vec![t("Grace")]]
+    );
+    // Index access, IN lists, LIMIT and OFFSET as parameters, aggregates.
+    let by_city = db
+        .prepare("SELECT id FROM people WHERE city = ? ORDER BY id LIMIT ? OFFSET ?")
+        .unwrap();
+    assert_eq!(
+        db.execute_prepared(&by_city, &[t("London"), i(5), i(0)])
+            .unwrap()
+            .rows,
+        vec![vec![i(1)], vec![i(3)]]
+    );
+    assert_eq!(
+        db.execute_prepared(&by_city, &[t("London"), i(1), i(1)])
+            .unwrap()
+            .rows,
+        vec![vec![i(3)]]
+    );
+    // A LIMIT parameter is read the way a literal is.
+    for lim in [t("x"), t("1"), Value::Real(1.5), Value::Null] {
+        let literal = db.execute(
+            "SELECT id FROM people WHERE city = 'London' ORDER BY id LIMIT ? OFFSET 0",
+            std::slice::from_ref(&lim),
+        );
+        let prepared = db.execute_prepared(&by_city, &[t("London"), lim.clone(), i(0)]);
+        assert_eq!(
+            literal.map(|r| r.rows).map_err(|e| e.to_string()),
+            prepared.map(|r| r.rows).map_err(|e| e.to_string()),
+            "LIMIT {lim:?}"
+        );
+    }
+    let ins = db
+        .prepare("SELECT count(*), max(age) FROM people WHERE id IN (?, ?, ?) HAVING count(*) > ?")
+        .unwrap();
+    assert_eq!(
+        db.execute_prepared(&ins, &[i(1), i(2), i(9), i(0)])
+            .unwrap()
+            .rows,
+        vec![vec![i(2), i(45)]]
+    );
+    assert!(db
+        .execute_prepared(&ins, &[i(1), i(2), i(9), i(5)])
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
+fn prepared_statement_checks() {
+    let db = db();
+    people(&db);
+    let st = db.prepare("SELECT name FROM people WHERE id = ?").unwrap();
+    let err = db.execute_prepared(&st, &[]).unwrap_err();
+    assert!(
+        err.to_string().contains("1 parameters but 0 were given"),
+        "{err}"
+    );
+    // A statement belongs to the handle that prepared it.
+    let other = self::db();
+    people(&other);
+    let err = other.execute_prepared(&st, &[i(1)]).unwrap_err();
+    assert!(err.to_string().contains("another database handle"), "{err}");
+    let err = other
+        .begin_read()
+        .unwrap()
+        .query_prepared(&st, &[i(1)])
+        .unwrap_err();
+    assert!(err.to_string().contains("another database handle"), "{err}");
+    let err = other
+        .begin_write()
+        .unwrap()
+        .execute_prepared(&st, &[i(1)])
+        .unwrap_err();
+    assert!(err.to_string().contains("another database handle"), "{err}");
+    // Parse errors come at prepare time.
+    assert!(db.prepare("SELEKT 1").is_err());
+    // A missing table is reported when the statement runs, and a plan is
+    // made once the table exists.
+    let later = db.prepare("SELECT v FROM later WHERE k = ?").unwrap();
+    assert!(db.execute_prepared(&later, &[i(1)]).is_err());
+    db.execute(
+        "CREATE TABLE later (k INTEGER PRIMARY KEY, v TEXT); INSERT INTO later VALUES (1, 'one')",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_prepared(&later, &[i(1)]).unwrap().rows,
+        vec![vec![t("one")]]
+    );
+}
+
+#[test]
+fn prepared_plans_follow_schema_changes() {
+    let db = db();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT); INSERT INTO s VALUES (1, 'a'), (2, 'b')",
+        &[],
+    )
+    .unwrap();
+    let st = db.prepare("SELECT * FROM s WHERE id = ?").unwrap();
+    assert_eq!(
+        db.execute_prepared(&st, &[i(1)]).unwrap().rows,
+        vec![vec![i(1), t("a")]]
+    );
+    // Data changes keep the plan and show the new rows.
+    db.execute("UPDATE s SET v = 'A' WHERE id = 1", &[])
+        .unwrap();
+    assert_eq!(
+        db.execute_prepared(&st, &[i(1)]).unwrap().rows,
+        vec![vec![i(1), t("A")]]
+    );
+    // A snapshot taken before a schema change keeps answering with the old
+    // schema; new snapshots see the new one.
+    let mut old = db.begin_read().unwrap();
+    db.execute(
+        "DROP TABLE s; CREATE TABLE s (id INTEGER PRIMARY KEY, v TEXT, w INTEGER); INSERT INTO s VALUES (1, 'x', 7)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        db.execute_prepared(&st, &[i(1)]).unwrap().rows,
+        vec![vec![i(1), t("x"), i(7)]]
+    );
+    assert_eq!(
+        old.query_prepared(&st, &[i(1)]).unwrap().rows,
+        vec![vec![i(1), t("A")]]
+    );
+    assert_eq!(
+        db.execute_prepared(&st, &[i(1)]).unwrap().rows,
+        vec![vec![i(1), t("x"), i(7)]]
+    );
+    // Dropped: the statement fails, and works again once the table is back.
+    db.execute("DROP TABLE s", &[]).unwrap();
+    assert!(db.execute_prepared(&st, &[i(1)]).is_err());
+}
+
+#[test]
+fn prepared_writes() {
+    let db = db();
+    people(&db);
+    let ins = db
+        .prepare("INSERT INTO people (id, name, age) VALUES (?, ?, ?)")
+        .unwrap();
+    assert!(!ins.read_only());
+    assert_eq!(
+        db.execute_prepared(&ins, &[i(10), t("Kay"), i(30)])
+            .unwrap()
+            .changes,
+        1
+    );
+    // Inside one write transaction, a prepared SELECT sees the
+    // transaction's own writes.
+    let q = db
+        .prepare("SELECT count(*) FROM people WHERE age > ?")
+        .unwrap();
+    let mut tx = db.begin_write().unwrap();
+    tx.execute_prepared(&ins, &[i(11), t("Lin"), i(50)])
+        .unwrap();
+    assert_eq!(
+        tx.execute_prepared(&q, &[i(40)]).unwrap().rows,
+        vec![vec![i(3)]]
+    );
+    tx.commit().unwrap();
+    assert!(db.execute_prepared(&ins, &[i(10), t("Dup"), i(1)]).is_err());
+}

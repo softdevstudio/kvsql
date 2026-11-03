@@ -21,7 +21,7 @@ use crate::idhash::{IdMap, IdSet};
 use crate::page::{
     self, get_u32, get_u64, new_page, put_u32, put_u64, PageType, HEADER, PAGE_SIZE,
 };
-use crate::sql::{self, QueryResult, SchemaCache, SchemaMap, Value as SqlValue};
+use crate::sql::{self, QueryResult, SchemaCache, SchemaMap, Statement, Value as SqlValue};
 use crate::storage::{FileStorage, Storage};
 use crate::tree::{self, Page, PageRead, PageWrite, TreeStats, Val, MAX_KEY_LEN, MAX_VALUE_LEN};
 
@@ -252,7 +252,11 @@ struct Shared {
     schemas: Mutex<SharedSchemas>,
     /// Parsed SQL by text.
     stmts: sql::StmtCache,
+    /// Tells this handle's prepared statements from another's.
+    id: u64,
 }
+
+static NEXT_DB_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Default)]
 struct SharedSchemas {
@@ -527,6 +531,7 @@ impl Db {
             writer: Mutex::new(()),
             schemas: Mutex::new(SharedSchemas::default()),
             stmts: sql::StmtCache::default(),
+            id: NEXT_DB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         // Load the free list. Nobody holds a snapshot yet, so every listed
         // page is free to reuse at once.
@@ -654,6 +659,33 @@ impl Db {
         let r = sql::execute(&mut tx, &parsed, params)?;
         tx.commit()?;
         Ok(r)
+    }
+
+    /// Parse SQL once for many runs. See [`Statement`].
+    pub fn prepare(&self, sql_text: &str) -> Result<Statement> {
+        let parsed = self.shared.stmts.parse(sql_text)?;
+        Ok(Statement::new(self.shared.id, sql_text, parsed))
+    }
+
+    /// [`Db::execute`] for a prepared statement.
+    pub fn execute_prepared(&self, st: &Statement, params: &[SqlValue]) -> Result<QueryResult> {
+        self.check_statement(st)?;
+        if st.read_only() {
+            return self.begin_read()?.query_prepared(st, params);
+        }
+        let mut tx = self.begin_write()?;
+        let r = sql::execute(&mut tx, &st.parsed, params)?;
+        tx.commit()?;
+        Ok(r)
+    }
+
+    fn check_statement(&self, st: &Statement) -> Result<()> {
+        if st.db != self.shared.id {
+            return Err(Error::Sql(
+                "this statement was prepared on another database handle".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// KV door for tables: the row with this primary key, read straight from
@@ -847,6 +879,18 @@ impl ReadTx<'_> {
     pub fn query(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
         let parsed = self.shared.stmts.parse(sql_text)?;
         sql::query(self, &parsed, params)
+    }
+
+    /// [`ReadTx::query`] for a prepared statement. A single SELECT reuses
+    /// its compiled plan while the schema stays the same.
+    pub fn query_prepared(&mut self, st: &Statement, params: &[SqlValue]) -> Result<QueryResult> {
+        if st.db != self.shared.id {
+            return Err(Error::Sql(
+                "this statement was prepared on another database handle".into(),
+            ));
+        }
+        let generation = (self.schema_generation != u64::MAX).then_some(self.schema_generation);
+        sql::query_prepared(self, st, generation, params)
     }
 
     /// KV door for tables: see [`Db::get_row`].
@@ -1228,6 +1272,18 @@ impl WriteTx<'_> {
     pub fn execute(&mut self, sql_text: &str, params: &[SqlValue]) -> Result<QueryResult> {
         let parsed = self.shared.stmts.parse(sql_text)?;
         sql::execute(self, &parsed, params)
+    }
+
+    /// [`WriteTx::execute`] for a prepared statement. Inside a write
+    /// transaction the schema can change between statements, so it runs
+    /// from the parsed form without a cached plan.
+    pub fn execute_prepared(&mut self, st: &Statement, params: &[SqlValue]) -> Result<QueryResult> {
+        if st.db != self.shared.id {
+            return Err(Error::Sql(
+                "this statement was prepared on another database handle".into(),
+            ));
+        }
+        sql::execute(self, &st.parsed, params)
     }
 
     /// KV door for tables: see [`Db::get_row`].

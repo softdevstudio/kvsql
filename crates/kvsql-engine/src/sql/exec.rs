@@ -157,6 +157,7 @@ pub fn delete_row_by_pk<K: KvWrite>(kv: &mut K, table: &str, pk: &Value) -> Resu
 // ---------------------------------------------------------------------------
 // Access paths
 
+#[derive(Clone)]
 enum Access {
     Full,
     /// Primary key values, each evaluated against the row prefix.
@@ -462,7 +463,7 @@ fn insert<K: KvWrite>(
         for (e, &i) in exprs.iter().zip(&targets) {
             let mut b = Binder {
                 scope: &empty,
-                params,
+                params: Some(params),
                 aggs: None,
                 aliases: &[],
             };
@@ -502,7 +503,7 @@ fn matching<K: Kv>(
         Some(f) => Some(
             Binder {
                 scope: &scope,
-                params,
+                params: Some(params),
                 aggs: None,
                 aliases: &[],
             }
@@ -555,7 +556,7 @@ fn update<K: KvWrite>(
             .ok_or_else(|| Error::Sql(format!("no such column: {c}")))?;
         let e = Binder {
             scope: &scope,
-            params,
+            params: Some(params),
             aggs: None,
             aliases: &[],
         }
@@ -621,6 +622,7 @@ fn has_agg(e: &Expr) -> bool {
     }
 }
 
+#[derive(Clone)]
 struct Source {
     table: Arc<Table>,
     join: JoinKind,
@@ -633,7 +635,7 @@ fn int_arg(e: &Expr, params: &[Value], what: &str) -> Result<i64> {
     let v = eval(
         &Binder {
             scope: &empty,
-            params,
+            params: Some(params),
             aggs: None,
             aliases: &[],
         }
@@ -703,7 +705,132 @@ fn join<K: Kv>(
     Ok(true)
 }
 
+/// A SELECT with its tables resolved, its expressions bound and its access
+/// paths chosen. Compiled with parameter values, it holds them as literals;
+/// compiled without, it holds parameter slots and is filled in per run by
+/// [`SelectPlan::with_params`].
+#[derive(Clone)]
+pub(crate) struct SelectPlan {
+    names: Vec<String>,
+    sources: Vec<Source>,
+    filter: Option<E>,
+    distinct: bool,
+    desc: Vec<bool>,
+    /// LIMIT and OFFSET, worked out when the values were known at compile
+    /// time; otherwise their expressions, worked out per run.
+    limit: Bound,
+    offset: Bound,
+    body: Body,
+    has_params: bool,
+}
+
+#[derive(Clone)]
+enum Bound {
+    None,
+    Known(i64),
+    Expr(Expr),
+}
+
+#[derive(Clone)]
+enum Body {
+    Rows {
+        items: Vec<E>,
+        keys: Vec<E>,
+    },
+    Groups {
+        specs: Vec<AggSpec>,
+        items: Vec<E>,
+        having: Option<E>,
+        keys: Vec<E>,
+        group_exprs: Vec<E>,
+        width: usize,
+    },
+}
+
+impl Access {
+    fn with_params(&self, p: &[Value]) -> Access {
+        match self {
+            Access::Full => Access::Full,
+            Access::Keys(k) => Access::Keys(k.iter().map(|e| e.with_params(p)).collect()),
+            Access::Range(lo, hi) => Access::Range(
+                lo.as_ref().map(|e| e.with_params(p)),
+                hi.as_ref().map(|e| e.with_params(p)),
+            ),
+            Access::Index(n, t, e) => Access::Index(n.clone(), *t, e.with_params(p)),
+        }
+    }
+}
+
+impl SelectPlan {
+    /// A copy of the plan with parameter slots filled in.
+    fn with_params(&self, p: &[Value]) -> SelectPlan {
+        let v = |l: &[E]| l.iter().map(|e| e.with_params(p)).collect::<Vec<_>>();
+        let o = |e: &Option<E>| e.as_ref().map(|e| e.with_params(p));
+        SelectPlan {
+            names: self.names.clone(),
+            sources: self
+                .sources
+                .iter()
+                .map(|s| Source {
+                    table: s.table.clone(),
+                    join: s.join,
+                    on: o(&s.on),
+                    access: s.access.with_params(p),
+                })
+                .collect(),
+            filter: o(&self.filter),
+            distinct: self.distinct,
+            desc: self.desc.clone(),
+            limit: self.limit.clone(),
+            offset: self.offset.clone(),
+            body: match &self.body {
+                Body::Rows { items, keys } => Body::Rows {
+                    items: v(items),
+                    keys: v(keys),
+                },
+                Body::Groups {
+                    specs,
+                    items,
+                    having,
+                    keys,
+                    group_exprs,
+                    width,
+                } => Body::Groups {
+                    specs: specs
+                        .iter()
+                        .map(|s| AggSpec {
+                            kind: s.kind,
+                            arg: o(&s.arg),
+                            sep: o(&s.sep),
+                            distinct: s.distinct,
+                        })
+                        .collect(),
+                    items: v(items),
+                    having: o(having),
+                    keys: v(keys),
+                    group_exprs: v(group_exprs),
+                    width: *width,
+                },
+            },
+            has_params: false,
+        }
+    }
+}
+
+/// Run a SELECT with its parameter values.
 pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<QueryResult> {
+    let plan = compile_select(kv, sel, Some(params))?;
+    run_select(kv, &plan, params)
+}
+
+/// Compile a SELECT. With `params`, they are bound as literals and LIMIT
+/// and OFFSET are worked out now, in the same order of checks as before
+/// plans existed; without, the plan keeps parameter slots.
+pub(crate) fn compile_select<K: Kv>(
+    kv: &mut K,
+    sel: &Select,
+    params: Option<&[Value]>,
+) -> Result<SelectPlan> {
     // Sources and the column scope.
     let mut scope = Scope::new();
     let mut tables = Vec::new();
@@ -875,62 +1002,23 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         return sql_err("HAVING needs GROUP BY or an aggregate");
     }
 
-    let limit = match &sel.limit {
-        Some(e) => {
-            let n = int_arg(e, params, "LIMIT")?;
-            if n < 0 {
-                None
-            } else {
-                Some(n as usize)
-            }
-        }
-        None => None,
+    let bound = |e: &Option<Expr>, what: &str| -> Result<Bound> {
+        Ok(match (e, params) {
+            (None, _) => Bound::None,
+            (Some(e), Some(p)) => Bound::Known(int_arg(e, p, what)?),
+            (Some(e), None) => Bound::Expr(e.clone()),
+        })
     };
-    let offset = match &sel.offset {
-        Some(e) => int_arg(e, params, "OFFSET")?.max(0) as usize,
-        None => 0,
-    };
+    let limit = bound(&sel.limit, "LIMIT")?;
+    let offset = bound(&sel.offset, "OFFSET")?;
 
-    let mut rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::new(); // (sort keys, output)
-
-    if !aggregate {
+    let body = if !aggregate {
         let items: Vec<E> = item_exprs.iter().map(bind_plain).collect::<Result<_>>()?;
         let keys: Vec<E> = order_terms
             .iter()
             .map(|(e, _)| bind_late(e))
             .collect::<Result<_>>()?;
-        // Without ORDER BY or DISTINCT we can stop as soon as LIMIT is met.
-        let stop_at = if keys.is_empty() && !sel.distinct {
-            limit.map(|l| l + offset)
-        } else {
-            None
-        };
-        let mut seen: BTreeSet<Vec<OrdVal>> = BTreeSet::new();
-        let mut emit = |_: &mut K, row: &[Value]| -> Result<bool> {
-            if let Some(f) = &filter {
-                if eval(f, row, &[])?.truth() != Some(true) {
-                    return Ok(true);
-                }
-            }
-            let out: Vec<Value> = items
-                .iter()
-                .map(|e| eval(e, row, &[]))
-                .collect::<Result<_>>()?;
-            if sel.distinct && !seen.insert(out.iter().cloned().map(OrdVal).collect()) {
-                return Ok(true);
-            }
-            let k: Vec<Value> = keys
-                .iter()
-                .map(|e| eval(e, row, &[]))
-                .collect::<Result<_>>()?;
-            rows.push((k, out));
-            Ok(stop_at.is_none_or(|n| rows.len() < n))
-        };
-        if sources.is_empty() {
-            emit(kv, &[])?;
-        } else {
-            join(kv, &sources, 0, &mut Vec::new(), &mut emit)?;
-        }
+        Body::Rows { items, keys }
     } else {
         let mut specs: Vec<AggSpec> = Vec::new();
         let bind_agg = |e: &Expr, specs: &mut Vec<AggSpec>| {
@@ -956,8 +1044,134 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
             .map(|(e, _)| bind_agg(e, &mut specs))
             .collect::<Result<_>>()?;
         let group_exprs: Vec<E> = group_terms.iter().map(bind_late).collect::<Result<_>>()?;
+        Body::Groups {
+            specs,
+            items,
+            having,
+            keys,
+            group_exprs,
+            width: scope.len(),
+        }
+    };
+    let mut plan = SelectPlan {
+        names,
+        sources,
+        filter,
+        distinct: sel.distinct,
+        desc: order_terms.iter().map(|(_, d)| *d).collect(),
+        limit,
+        offset,
+        body,
+        has_params: false,
+    };
+    plan.has_params = params.is_none() && plan_has_params(&plan);
+    Ok(plan)
+}
+
+fn plan_has_params(p: &SelectPlan) -> bool {
+    let any = |l: &[E]| l.iter().any(E::has_params);
+    let opt = |e: &Option<E>| e.as_ref().is_some_and(E::has_params);
+    let access = |a: &Access| match a {
+        Access::Full => false,
+        Access::Keys(k) => any(k),
+        Access::Range(lo, hi) => opt(lo) || opt(hi),
+        Access::Index(_, _, e) => e.has_params(),
+    };
+    let body = match &p.body {
+        Body::Rows { items, keys } => any(items) || any(keys),
+        Body::Groups {
+            specs,
+            items,
+            having,
+            keys,
+            group_exprs,
+            ..
+        } => {
+            specs.iter().any(|s| opt(&s.arg) || opt(&s.sep))
+                || any(items)
+                || opt(having)
+                || any(keys)
+                || any(group_exprs)
+        }
+    };
+    opt(&p.filter) || p.sources.iter().any(|s| opt(&s.on) || access(&s.access)) || body
+}
+
+/// Run a compiled SELECT. A plan with parameter slots is filled in first.
+pub(crate) fn run_select<K: Kv>(
+    kv: &mut K,
+    plan: &SelectPlan,
+    params: &[Value],
+) -> Result<QueryResult> {
+    let filled;
+    let plan = if plan.has_params {
+        filled = plan.with_params(params);
+        &filled
+    } else {
+        plan
+    };
+    let bound = |b: &Bound, what: &str| -> Result<Option<i64>> {
+        Ok(match b {
+            Bound::None => None,
+            Bound::Known(n) => Some(*n),
+            Bound::Expr(e) => Some(int_arg(e, params, what)?),
+        })
+    };
+    let limit = match bound(&plan.limit, "LIMIT")? {
+        Some(n) if n >= 0 => Some(n as usize),
+        _ => None,
+    };
+    let offset = bound(&plan.offset, "OFFSET")?.map_or(0, |n| n.max(0) as usize);
+    let filter = &plan.filter;
+    let sources = &plan.sources;
+    let distinct = plan.distinct;
+
+    let mut rows: Vec<(Vec<Value>, Vec<Value>)> = Vec::new(); // (sort keys, output)
+
+    if let Body::Rows { items, keys } = &plan.body {
+        // Without ORDER BY or DISTINCT we can stop as soon as LIMIT is met.
+        let stop_at = if keys.is_empty() && !distinct {
+            limit.map(|l| l + offset)
+        } else {
+            None
+        };
+        let mut seen: BTreeSet<Vec<OrdVal>> = BTreeSet::new();
+        let mut emit = |_: &mut K, row: &[Value]| -> Result<bool> {
+            if let Some(f) = &filter {
+                if eval(f, row, &[])?.truth() != Some(true) {
+                    return Ok(true);
+                }
+            }
+            let out: Vec<Value> = items
+                .iter()
+                .map(|e| eval(e, row, &[]))
+                .collect::<Result<_>>()?;
+            if distinct && !seen.insert(out.iter().cloned().map(OrdVal).collect()) {
+                return Ok(true);
+            }
+            let k: Vec<Value> = keys
+                .iter()
+                .map(|e| eval(e, row, &[]))
+                .collect::<Result<_>>()?;
+            rows.push((k, out));
+            Ok(stop_at.is_none_or(|n| rows.len() < n))
+        };
+        if sources.is_empty() {
+            emit(kv, &[])?;
+        } else {
+            join(kv, sources, 0, &mut Vec::new(), &mut emit)?;
+        }
+    } else if let Body::Groups {
+        specs,
+        items,
+        having,
+        keys,
+        group_exprs,
+        width,
+    } = &plan.body
+    {
+        let width = *width;
         let mut groups: BTreeMap<Vec<OrdVal>, (Vec<Value>, Vec<Acc>)> = BTreeMap::new();
-        let width = scope.len();
         let mut emit = |_: &mut K, row: &[Value]| -> Result<bool> {
             if let Some(f) = &filter {
                 if eval(f, row, &[])?.truth() != Some(true) {
@@ -971,7 +1185,7 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
             let entry = groups
                 .entry(gk)
                 .or_insert_with(|| (row.to_vec(), vec![Acc::default(); specs.len()]));
-            for (acc, spec) in entry.1.iter_mut().zip(&specs) {
+            for (acc, spec) in entry.1.iter_mut().zip(specs) {
                 acc.update(spec, row)?;
             }
             Ok(true)
@@ -979,7 +1193,7 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         if sources.is_empty() {
             emit(kv, &[])?;
         } else {
-            join(kv, &sources, 0, &mut Vec::new(), &mut emit)?;
+            join(kv, sources, 0, &mut Vec::new(), &mut emit)?;
         }
         if groups.is_empty() && group_exprs.is_empty() {
             groups.insert(
@@ -991,10 +1205,10 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         for (_, (first, accs)) in groups {
             let aggv: Vec<Value> = accs
                 .iter()
-                .zip(&specs)
+                .zip(specs)
                 .map(|(a, s)| a.finish(s))
                 .collect::<Result<_>>()?;
-            if let Some(h) = &having {
+            if let Some(h) = having {
                 if eval(h, &first, &aggv)?.truth() != Some(true) {
                     continue;
                 }
@@ -1003,7 +1217,7 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
                 .iter()
                 .map(|e| eval(e, &first, &aggv))
                 .collect::<Result<_>>()?;
-            if sel.distinct && !seen.insert(out.iter().cloned().map(OrdVal).collect()) {
+            if distinct && !seen.insert(out.iter().cloned().map(OrdVal).collect()) {
                 continue;
             }
             let k: Vec<Value> = keys
@@ -1014,9 +1228,9 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         }
     }
 
-    if !order_terms.is_empty() {
+    if !plan.desc.is_empty() {
         rows.sort_by(|(a, _), (b, _)| {
-            for (i, (_, desc)) in order_terms.iter().enumerate() {
+            for (i, desc) in plan.desc.iter().enumerate() {
                 let o = total_cmp(&a[i], &b[i]);
                 let o = if *desc { o.reverse() } else { o };
                 if o != Ordering::Equal {
@@ -1033,7 +1247,7 @@ pub fn select<K: Kv>(kv: &mut K, sel: &Select, params: &[Value]) -> Result<Query
         .map(|(_, r)| r)
         .collect();
     Ok(QueryResult {
-        columns: names,
+        columns: plan.names.clone(),
         rows,
         changes: 0,
     })
