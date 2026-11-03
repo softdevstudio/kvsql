@@ -210,6 +210,15 @@ fn fs_type(p: &Path) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// One row holding one text value equal to `want`, checked without allocating.
+fn text_row(rows: &[Vec<Value>], want: &str) -> bool {
+    matches!(rows, [row] if matches!(&row[..], [Value::Text(s)] if s == want))
+}
+
+fn glue_row(rows: &[Vec<GValue>], want: &str) -> bool {
+    matches!(rows, [row] if matches!(&row[..], [GValue::Str(s)] if s == want))
+}
+
 fn glue_rows(p: Vec<Payload>) -> Vec<Vec<GValue>> {
     match p.into_iter().next() {
         Some(Payload::Select { rows, .. }) => rows,
@@ -449,8 +458,10 @@ fn main() {
                 for &s in &starts {
                     let items = kdb.scan("kv", &key(s), None, SCAN_LEN).unwrap();
                     assert_eq!(items.len(), SCAN_LEN);
-                    assert_eq!(items[0].0, key(s));
-                    assert_eq!(items[SCAN_LEN - 1].1, values[s + SCAN_LEN - 1]);
+                    for (c, (k, v)) in items.iter().enumerate() {
+                        assert_eq!(&k[..], &key(s + c)[..]);
+                        assert!(!v.is_empty());
+                    }
                 }
             }),
             case(
@@ -522,7 +533,16 @@ fn main() {
                     let r = kdb
                         .execute("SELECT name FROM t WHERE id = ?", &[Value::Int(i as i64)])
                         .unwrap();
-                    assert_eq!(r.rows, vec![vec![Value::Text(names[i].clone())]]);
+                    assert!(text_row(&r.rows, &names[i]));
+                }
+            }),
+            case("KvSQL `ReadTx::query`, one snapshot per round", n, || {
+                let mut tx = kdb.begin_read().unwrap();
+                for &i in &order {
+                    let r = tx
+                        .query("SELECT name FROM t WHERE id = ?", &[Value::Int(i as i64)])
+                        .unwrap();
+                    assert!(text_row(&r.rows, &names[i]));
                 }
             }),
             case(
@@ -536,7 +556,7 @@ fn main() {
                             g.execute_with_params("SELECT name FROM t WHERE id = $1", [i as i64])
                                 .unwrap(),
                         );
-                        assert_eq!(rows, vec![vec![GValue::Str(names[i].clone())]]);
+                        assert!(glue_row(&rows, &names[i]));
                     }
                     g.execute("COMMIT").unwrap();
                 },
@@ -551,7 +571,7 @@ fn main() {
                             g.execute_with_params("SELECT name FROM t WHERE id = $1", [i as i64])
                                 .unwrap(),
                         );
-                        assert_eq!(rows.len(), 1);
+                        assert!(glue_row(&rows, &names[i]));
                     }
                 },
             ),
@@ -574,7 +594,7 @@ fn main() {
             case("KvSQL `Db::get_row` (key door, no SQL)", n, || {
                 for &i in &order {
                     let r = kdb.get_row("t", &Value::Int(i as i64)).unwrap().unwrap();
-                    assert_eq!(r[1], Value::Text(names[i].clone()));
+                    assert!(matches!(&r[1], Value::Text(s) if s == &names[i]));
                 }
             }),
         ],
@@ -652,7 +672,7 @@ fn main() {
     drop(conn);
     println!("## Bulk load in one transaction, and size on disk\n");
     println!("Loads are timed once, before the tables above. KvSQL, redb, fjall and SQLite load through their APIs one key or row at a time; GlueSQL takes {} `INSERT` statements of up to 1000 rows each in one transaction. fjall's load is one write batch and a sync; flushing it to on-disk tables and compacting them took {} more.\n", n.div_ceil(1000), fmt(f_flush));
-    println!("Sizes are read after every write above, with each store closed (fjall: its whole folder; SQLite: the database file and its WAL). File length is what a directory listing shows; allocated is what the file system holds (fjall preallocates its journal to 64 MiB as a sparse file). The stores hold different things, so sizes can't be compared across rows: KvSQL and SQLite hold the keys, the table and space left by about a thousand commits; redb and fjall hold only the keys; GlueSQL only the table.\n");
+    println!("Sizes are read after every write above, with each store closed (fjall: its whole folder; SQLite: the database file and its WAL). File length is what a directory listing shows; allocated is what the file system holds (fjall preallocates its journal to 64 MiB as a sparse file). The stores hold different things, so sizes can't be compared across rows: KvSQL and SQLite hold the keys, the table and space left by {} single-write commits; redb and fjall hold only the keys; GlueSQL only the table.\n", commits * ROUNDS);
     println!("| Store | Load {n} keys | Load {n} table rows | File length | Allocated |");
     println!("|---|---|---|---|---|");
     println!(
